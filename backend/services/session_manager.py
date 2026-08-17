@@ -575,12 +575,15 @@ class SessionManager:
             return True
 
     def assign_new_session_to_user(self, user_id) -> str:
-        """登录路径：直接新建一个会话并绑定到登录用户，避免空游客 session 污染历史。
+        """登录路径：新建一个会话并绑定到登录用户，避免空游客 session 污染历史。
 
         - 新建 session（uuid）→ 立即落库并 user_id=user_id 绑定
         - 返回新 session_id 给前端，前端用其覆盖 localStorage.sessionId
         用于：登录请求带的 session_id 是空 session 时（crud.reassign_session_to_user 会返回 False），
         仍要给登录用户一个有效的、归属正确的 session 以便后续上传文件落库。
+
+        注意：游客态的对话不保留（用户需求：仅保留登录用户的会话历史）。
+        登录用户自己的历史会话靠 user_id 归属 + crud.list_sessions_by_user 恢复，不在此复制。
         """
         uid = crud.to_user_id_str(user_id)
         if uid is None:
@@ -821,7 +824,11 @@ class SessionManager:
 
     # ===== 多数据集新方法 =====
     def get_dataset_df(self, session_id: str, dataset_id: str) -> Optional[pd.DataFrame]:
-        """获取指定数据集的 df（缺失则从 pickle reload 回内存）"""
+        """获取指定数据集的 df（缺失则从 pickle reload 回内存）
+
+        兼容早期版本：DB 里的 original_path 可能指向失效的旧路径基准，
+        这里按多个候选顺序尝试 {session_id}_{did}.pkl / {did}.pkl 命名规则。
+        """
         session = self.get_session(session_id)
         if session is None:
             return None
@@ -830,15 +837,20 @@ class SessionManager:
             return None
         if ds.df is not None:
             return ds.df
-        if ds.original_path and os.path.exists(ds.original_path):
-            try:
-                ds.df = pd.read_pickle(ds.original_path)
-                return ds.df
-            except Exception:
-                if ds.df_original is not None:
-                    ds.df = ds.df_original
+        candidate_paths = []
+        if ds.original_path:
+            candidate_paths.append(ds.original_path)
+        candidate_paths.append(os.path.join(self._original_dir, f"{session_id}_{dataset_id}.pkl"))
+        candidate_paths.append(os.path.join(self._original_dir, f"{dataset_id}.pkl"))
+        for cand in candidate_paths:
+            if cand and os.path.exists(cand):
+                try:
+                    ds.df = pd.read_pickle(cand)
+                    if ds.original_path != cand:
+                        ds.original_path = cand
                     return ds.df
-                return None
+                except Exception:
+                    continue
         if ds.df_original is not None:
             ds.df = ds.df_original
             return ds.df

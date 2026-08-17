@@ -25,12 +25,37 @@ class QuotaExceededError(Exception):
     """数据集数量超过用户配额时抛出，由路由转换为 403 QUOTA_EXCEEDED。"""
 
 
+def _sanitize_nonfinite(obj: Any) -> Any:
+    """递归把 NaN / +Inf / -Inf 替换为 None，避免 JSON 序列化报
+    'Out of range float values are not JSON compliant'（往返数据库时死锁）。
+
+    - 标量 float: math.isfinite 判断；非有限 → None
+    - dict / list: 递归
+    - tuple / set: 列表化以保持 JSON 可序列化
+    - str / int / bool / None: 原样
+    """
+    import math
+    if obj is None or isinstance(obj, (bool, int, str)):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_nonfinite(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_nonfinite(v) for v in obj]
+    if isinstance(obj, set):
+        return [_sanitize_nonfinite(v) for v in obj]
+    return obj
+
+
 def _to_json(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, default=str)
+    return json.dumps(_sanitize_nonfinite(obj), ensure_ascii=False, default=str)
 
 
 def _from_json(text: str) -> Any:
-    return json.loads(text)
+    return _sanitize_nonfinite(json.loads(text))
 
 
 def to_user_id_str(user_id: Any) -> Optional[str]:
@@ -113,31 +138,59 @@ def list_sessions_by_user(user_id: Any) -> List[Dict[str, Any]]:
             state = _from_json(r["state_json"])
         except Exception:
             state = {}
-        # 过滤空 session：state_json.dataset_packages 与 analysis_packages 至少一个非空
+        # 过滤空 session。判定"用户实际使用过"的口径：任一即可
+        #   1) state_json.dataset_packages 至少 1 个桶非空（用户在 UI 上传过数据集、跑过分析）
+        #   2) state_json.analysis_packages 非空（兜底；老格式）
+        #   3) state_json.chat_history 有 ≥1 条消息（用户问过 LLM 即视作"会话记录"）
+        #   4) datasets 表里有 ≥1 行（防御：state_json 与 datasets 表不同步的极端场景）
+        #   5) analysis_packages 表里有 ≥1 行（防御：同上）
+        # 旧的「必须 dataset_packages 或 analysis_packages 非空」过于苛刻，
+        # 导致「只问问题、还没出分析包」的会话被丢出历史列表（用户预期是"历史记录 = 过去聊过的会话"）。
         try:
+            sid = r["session_id"]
             dp = state.get("dataset_packages") or {}
             ap = state.get("analysis_packages") or {}
-            if not isinstance(dp, dict): dp = {}
-            if not isinstance(ap, dict): ap = {}
-            has_work = False
-            for bucket in dp.values():
-                if isinstance(bucket, dict) and len(bucket) > 0:
-                    has_work = True
-                    break
-            if not has_work and len(ap) > 0:
-                has_work = True
-            if not has_work:
-                # 空 session 不进入历史（即便绑到了用户，也不代表用户实际使用过）
-                continue
+            ch = state.get("chat_history") or []
+            state_has_work = (
+                (isinstance(dp, dict) and any(isinstance(v, dict) and v for v in dp.values()))
+                or (isinstance(ap, dict) and len(ap) > 0)
+                or (isinstance(ch, list) and len(ch) > 0)
+            )
+            if not state_has_work:
+                # 兜底再查一次 db 表
+                nonempty = conn.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM datasets          WHERE session_id = ?) AS d_count,
+                      (SELECT COUNT(*) FROM analysis_packages WHERE session_id = ?) AS p_count
+                    """,
+                    (sid, sid),
+                ).fetchone()
+                if not (bool(nonempty) and (int(nonempty["d_count"] or 0) > 0
+                                              or int(nonempty["p_count"] or 0) > 0)):
+                    continue
         except Exception:
             continue
         # 取一个数据集名作为会话标题兜底
         title = state.get("custom_title") or ""
+        # 数据集 / 分析包数量：优先以数据库表为准（更准确），
+        # state_json.dataset_packages 仅在内存层缓存，可能与持久化层不一致。
+        # 例如新上传的数据集还没回流到 state_json 时，UI 上能看到数据集但历史列表显示 0。
         ds_count = 0
         try:
-            ds_count = len(state.get("dataset_packages", {}) or {})
+            ds_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM datasets WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            if ds_row and ds_row["n"]:
+                ds_count = int(ds_row["n"])
         except Exception:
-            ds_count = 0
+            pass
+        if ds_count == 0:
+            try:
+                ds_count = len(state.get("dataset_packages", {}) or {})
+            except Exception:
+                ds_count = 0
         first_ds_name = ""
         try:
             for bucket in (state.get("dataset_packages", {}) or {}).values():
@@ -150,23 +203,72 @@ def list_sessions_by_user(user_id: Any) -> List[Dict[str, Any]]:
                     break
         except Exception:
             first_ds_name = ""
+        # 兜底：datasets 表里有但 state_json 没缓存时，从数据集表里取文件名做标题
+        if not first_ds_name and ds_count > 0:
+            try:
+                row = conn.execute(
+                    "SELECT meta_json FROM datasets WHERE session_id = ? LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                if row and row["meta_json"]:
+                    meta = _from_json(row["meta_json"])
+                    first_ds_name = (
+                        (meta or {}).get("file_name")
+                        or (meta or {}).get("original_filename")
+                        or ""
+                    )
+            except Exception:
+                pass
         if not title:
             title = first_ds_name or "未命名会话"
         pkg_count = 0
         try:
-            pkg_count = len(state.get("analysis_packages", {}) or {})
+            ap_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM analysis_packages WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            if ap_row and ap_row["n"]:
+                pkg_count = int(ap_row["n"])
         except Exception:
-            pkg_count = 0
+            pass
+        if pkg_count == 0:
+            try:
+                pkg_count = len(state.get("analysis_packages", {}) or {})
+            except Exception:
+                pkg_count = 0
         result.append({
             "session_id": r["session_id"],
             "title": title,
             "last_page": state.get("last_page") or "upload",
             "dataset_count": ds_count,
             "package_count": pkg_count,
+            "chat_count": (
+                len(state.get("chat_history") or [])
+                if isinstance(state.get("chat_history"), list)
+                else 0
+            ),
             "created_at": r["created_at"],
             "last_access": r["last_access"],
         })
     return result
+
+
+def get_latest_session_for_user(user_id: Any) -> Optional[str]:
+    """取该用户最近访问的会话 id（不限是否有数据/分析），
+
+    用于登录兜底时恢复用户上一次的登录会话（含纯对话会话）。
+    游客会话（user_id IS NULL）不会被返回，从而「不保留游客历史」自然成立。
+    """
+    uid = to_user_id_str(user_id)
+    if uid is None:
+        return None
+    conn = get_connection()
+    _ensure_sessions_user_column(conn)
+    row = conn.execute(
+        "SELECT session_id FROM sessions WHERE user_id = ? ORDER BY last_access DESC LIMIT 1",
+        (uid,),
+    ).fetchone()
+    return row["session_id"] if row else None
 
 
 def load_session_state(session_id: str) -> Optional[Dict[str, Any]]:
@@ -466,7 +568,7 @@ def revoke_user_tokens(user_id: int) -> int:
 def get_user_dataset_limit(user_id: int) -> int:
     conn = get_connection()
     row = conn.execute("SELECT dataset_limit FROM users WHERE id = ?", (user_id,)).fetchone()
-    return int(row["dataset_limit"]) if row else 10
+    return int(row["dataset_limit"]) if row else 50
 
 
 def count_user_datasets(user_id: int) -> int:

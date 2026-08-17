@@ -49,9 +49,9 @@ export default function App() {
             <Route path="/register" element={<RegisterPage />} />
             {/* 公开只读分享页（无需登录，独立全屏） */}
             <Route path="/shared/:id" element={<SharedPage />} />
-            {/* 独立智能体：不套 Layout，无侧边栏，纯全屏对话体验 */}
-            <Route path="/chat" element={<ChatPage />} />
             <Route element={<Layout />}>
+              {/* 智能对话：嵌入侧边栏框架，与「数据上传」共享 DataContext */}
+              <Route path="/chat" element={<ChatPage />} />
               <Route path="/upload" element={<UploadPage />} />
               <Route path="/clean" element={<CleanPage />} />
               <Route path="/analysis" element={<AnalysisPage />} />

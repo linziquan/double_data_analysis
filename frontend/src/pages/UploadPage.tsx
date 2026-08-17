@@ -16,7 +16,7 @@ const ACCEPT = '.csv, .xlsx, .xls, .json, .sqlite, .db';
 export default function UploadPage() {
   const { state, dispatch, ensureValidSession } = useData();
   const navigate = useNavigate();
-  const { sessionId, datasets, activeDatasetId, usedBytes, quotaBytes, fileName, rows, columns, preview, columnInfo } = state;
+  const { sessionId, datasets, activeDatasetId, usedBytes, quotaBytes, datasetCount, datasetLimit, fileName, rows, columns, preview, columnInfo } = state;
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -28,7 +28,13 @@ export default function UploadPage() {
         const res = await listDatasets(sessionId);
         if (!alive) return;
         dispatch({ type: 'SET_DATASETS', datasets: res.datasets });
-        dispatch({ type: 'SET_QUOTA', usedBytes: res.used_bytes, quotaBytes: res.quota_bytes });
+        dispatch({
+          type: 'SET_QUOTA',
+          usedBytes: res.used_bytes,
+          quotaBytes: res.quota_bytes,
+          datasetCount: res.dataset_count,
+          datasetLimit: res.dataset_limit ?? null,
+        });
         const active = res.datasets.find((d) => d.is_active);
         if (active) dispatch({ type: 'SELECT_DATASET', datasetId: active.dataset_id });
       } catch { /* 会话暂无数据，忽略 */ }
@@ -71,7 +77,13 @@ export default function UploadPage() {
         };
         dispatch({ type: 'ADD_DATASET', payload: ds });
       });
-      dispatch({ type: 'SET_QUOTA', usedBytes: res.used_bytes, quotaBytes: res.quota_bytes });
+      dispatch({
+        type: 'SET_QUOTA',
+        usedBytes: res.used_bytes,
+        quotaBytes: res.quota_bytes,
+        datasetCount: res.dataset_count,
+        datasetLimit: res.dataset_limit ?? null,
+      });
     } catch (e: any) {
       const msg = e?.response?.data?.detail || e?.message || '上传失败';
       throw new Error(msg);
@@ -88,7 +100,13 @@ export default function UploadPage() {
     try {
       const res = await listDatasets(sessionId);
       dispatch({ type: 'SET_DATASETS', datasets: res.datasets });
-      dispatch({ type: 'SET_QUOTA', usedBytes: res.used_bytes, quotaBytes: res.quota_bytes });
+      dispatch({
+        type: 'SET_QUOTA',
+        usedBytes: res.used_bytes,
+        quotaBytes: res.quota_bytes,
+        datasetCount: res.dataset_count,
+        datasetLimit: res.dataset_limit ?? null,
+      });
       const active = res.datasets.find((d) => d.is_active);
       if (active) dispatch({ type: 'SELECT_DATASET', datasetId: active.dataset_id });
     } catch { /* ignore */ }
@@ -98,7 +116,7 @@ export default function UploadPage() {
     if (!confirm('确定结束会话？该会话的全部数据（上传数据、清洗结果、分析产物、已保存图表）将被彻底清空。')) return;
     await clearData(sessionId);
     dispatch({ type: 'CLEAR_DATA' });
-    dispatch({ type: 'SET_QUOTA', usedBytes: 0, quotaBytes: 0 });
+    dispatch({ type: 'SET_QUOTA', usedBytes: 0, quotaBytes: 0, datasetCount: 0, datasetLimit: null });
     // 结束后自动创建新会话，避免死守已清空的旧 id
     const newId = await ensureValidSession();
     alert(`会话已结束，已创建新会话 ${newId}`);
@@ -113,7 +131,13 @@ export default function UploadPage() {
       }
       const res = await listDatasets(sessionId);
       dispatch({ type: 'SET_DATASETS', datasets: res.datasets });
-      dispatch({ type: 'SET_QUOTA', usedBytes: res.used_bytes, quotaBytes: res.quota_bytes });
+      dispatch({
+        type: 'SET_QUOTA',
+        usedBytes: res.used_bytes,
+        quotaBytes: res.quota_bytes,
+        datasetCount: res.dataset_count,
+        datasetLimit: res.dataset_limit ?? null,
+      });
       const active = res.datasets.find((d) => d.is_active);
       if (active) dispatch({ type: 'SELECT_DATASET', datasetId: active.dataset_id });
     } catch { /* ignore */ }
@@ -162,6 +186,22 @@ export default function UploadPage() {
         <div className="h-2 rounded-full bg-slate-200/70 overflow-hidden">
           <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, background: barColor }} />
         </div>
+        {/* 数据集数量配额（仅登录用户有 datasetLimit） */}
+        {datasetLimit !== null && datasetLimit !== undefined && (
+          <div className="mt-3 flex items-center gap-2 text-xs">
+            <Database size={12} className="text-violet-500" />
+            <span className="text-slate-600">数据集</span>
+            <span
+              className="font-medium"
+              style={{ color: datasetCount >= datasetLimit ? '#e11d48' : '#7c3aed' }}
+            >
+              {datasetCount} / {datasetLimit}
+            </span>
+            {datasetCount >= datasetLimit && (
+              <span className="text-rose-500">已满，请在下方列表删除部分数据集后重试</span>
+            )}
+          </div>
+        )}
         {full && <p className="text-xs text-rose-500 mt-2">额度已用尽，请删除部分报表或释放插槽。</p>}
       </div>
 

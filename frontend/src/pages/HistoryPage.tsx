@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { History, ChevronRight, Clock, AlertCircle, Layers, FileBarChart, Trash2 } from 'lucide-react';
+import { History, ChevronRight, Clock, AlertCircle, Layers, FileBarChart, Trash2, MessageSquare } from 'lucide-react';
 import { listSessions, deleteHistorySession, type HistorySession } from '../lib/api';
 import { useData } from '../contexts/DataContext';
 
 // 会话"最后访问页面"到前端路由的映射（智能恢复上下文时用）
 const PAGE_ROUTE: Record<string, string> = {
+  chat: '/chat',
   upload: '/upload',
   clean: '/clean',
   analysis: '/analysis',
@@ -45,14 +46,17 @@ export default function HistoryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 点开历史会话：恢复数据 + 智能跳转到上次最后访问页面
+  // 点开历史会话：恢复数据 + 智能跳转到智能对话页（统一入口，绕过 last_page）
+  // 之前的逻辑会按 last_page 跳转（如 /upload），导致对话上下文无法快速续上；
+  // 现在统一进入 /chat，由 ChatPage 的 useEffect 自动回填 session.messages，
+  // 即使用户上次最后停留在数据上传页，也能直接看到历史对话记录。
   const onOpen = async (session: HistorySession) => {
     if (restoringId || deletingId) return;
     setRestoringId(session.session_id);
     setError('');
     try {
       await restoreSession(session.session_id);
-      navigate(safeRoute(session.last_page), { replace: true });
+      navigate('/chat', { replace: true });
     } catch (err: any) {
       setError(err?.message || '恢复会话失败');
       setRestoringId(null);
@@ -158,6 +162,12 @@ export default function HistoryPage() {
                         <FileBarChart className="w-3.5 h-3.5" />
                         {s.package_count} 分析包
                       </span>
+                      {Number(s.chat_count || 0) > 0 && (
+                        <span className="flex items-center gap-1 text-violet-500">
+                          <MessageSquare className="w-3.5 h-3.5" />
+                          {s.chat_count} 条对话
+                        </span>
+                      )}
                       <span className="flex items-center gap-1">
                         <Clock className="w-3.5 h-3.5" />
                         {fmtTime(s.last_access)}

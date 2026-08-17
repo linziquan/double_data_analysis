@@ -500,12 +500,28 @@ export const chatSend = async (
   sessionId: string,
   message: string,
   choice?: string,
+  options?: {
+    apiKey?: string | null;
+    aiProvider?: string | null;
+    customModel?: string | null;
+    customBaseUrl?: string | null;
+  },
 ): Promise<ChatSendResponse> => {
   const { data } = await api.post<ChatSendResponse>('/chat/send', {
     session_id: sessionId,
     message,
     choice: choice ?? null,
+    api_key: options?.apiKey ?? null,
+    ai_provider: options?.aiProvider ?? null,
+    custom_model: options?.customModel ?? null,
+    custom_base_url: options?.customBaseUrl ?? null,
   });
+  return data;
+};
+
+/** 拉取会话的聊天历史（纯文字 user/assistant 对话流），用于从历史会话恢复后回填对话页。 */
+export const getChatMessages = async (sessionId: string): Promise<{ success: boolean; session_id: string; messages: any[] }> => {
+  const { data } = await api.get('/chat/messages', { params: { session_id: sessionId } });
   return data;
 };
 

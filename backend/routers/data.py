@@ -678,7 +678,9 @@ async def data_select(req: DatasetSelectRequest):
     """切换当前分析对象（active 数据集）；按需 reload 内存 df + 释放其余非 active 内存 df"""
     ok = manager.select_dataset(req.session_id, req.dataset_id)
     if not ok:
+        logger.warning("[select_dataset] failed sid=%s did=%s", req.session_id, req.dataset_id)
         raise HTTPException(status_code=404, detail="数据集不存在")
+    logger.info("[select_dataset] ok sid=%s did=%s", req.session_id, req.dataset_id)
     return sanitize_json({"success": True, "active_dataset_id": req.dataset_id})
 
 
@@ -690,11 +692,23 @@ async def data_datasets(session_id: str):
         used = session.uploaded_bytes if session else 0
         # API 配置整 session 一份，放 response 根级（与 used_bytes 同级），随刷新一并拉回
         api_cfg = manager.get_api_config(session_id)
+        # 数据集数量配额：登录用户走 users.dataset_limit；未登录/游客不限制（返 None）
+        datasets_list = manager.get_datasets(session_id)
+        dataset_limit = None
+        try:
+            from backend.db import crud as _crud
+            owner = session.user_id if session else None
+            if owner:
+                dataset_limit = _crud.get_user_dataset_limit(int(owner))
+        except Exception:
+            pass
         return sanitize_json({
             "success": True,
-            "datasets": manager.get_datasets(session_id),
+            "datasets": datasets_list,
             "used_bytes": used,
             "quota_bytes": QUOTA_BYTES,
+            "dataset_count": len(datasets_list),
+            "dataset_limit": dataset_limit,
             "api_key": api_cfg["api_key"],
             "ai_provider": api_cfg["ai_provider"],
             "custom_model": api_cfg["custom_model"],

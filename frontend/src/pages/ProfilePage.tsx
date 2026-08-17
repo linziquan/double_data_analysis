@@ -47,7 +47,9 @@ export default function ProfilePage() {
 
   const onLogout = async () => {
     await logout();
-    navigate('/');
+    // 硬刷新整页：避免任何 in-memory React state 里残留上一个用户的 datasets/API 配置
+    // 依赖 navigate 容易留下残留（UploadPage 自身的 useEffect 仍可能因旧 sessionId 再拉一次 listDatasets）。
+    window.location.href = '/';
   };
 
   return (

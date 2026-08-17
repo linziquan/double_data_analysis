@@ -1138,10 +1138,12 @@ def get_function_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "generate_chart",
-                "description": "根据指定图表类型和数据列生成 ECharts 图表。支持 30 种图表类型，"
-                               "包括 bar/line/pie/scatter/heatmap/radar/treemap 等。"
-                               "需要传入 chart_type（必填）以及对应的数据列参数（如 x/y/title）。"
-                               "适合在用户要求「画个图」「做一个柱状图」等可视化需求时调用。",
+                "description": "根据指定图表类型和数据列生成 ECharts 图表。支持 30+ 种图表类型。"
+                               "用户提到「漏斗/转化/流失路径/逐级流失」时，优先尝试 `chart_type=\"funnel\"`；"
+                               "若 funnel 生成失败（如无递进数值列），可降级用 `ranking`/`hbar`（按流失量排序的条形图）或 `bar`/`line` 体现流失，并向用户说明。"
+                               "传参方式：①列名（x=\"维度列\", y=\"数值列\"），引擎自动聚合；"
+                               "②字面量 data='[{\"name\":\"注册\",\"value\":8563}, ...]'（funnel/ranking 推荐此种）。"
+                               "必填 chart_type，其他可选 x/y/title/data。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1160,7 +1162,7 @@ def get_function_definitions() -> List[Dict[str, Any]]:
                         },
                         "data": {
                             "type": "string",
-                            "description": "现成数据数组（JSON 字符串），形如 '[{\"维度\":\"口红\",\"数值\":169}, ...]'。当不便给 x/y 列名时，可直接传入此聚合结果。",
+                            "description": "现成数据数组（JSON 字符串），形如 '[{\"name\":\"注册\",\"value\":8563}, ...]'。当不便给 x/y 列名时，可直接传入此聚合结果。funnel/ranking 图推荐用此种形式（x/y 形式也能工作）。",
                         },
                         "title": {
                             "type": "string",

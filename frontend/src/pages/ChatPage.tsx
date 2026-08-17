@@ -1,27 +1,26 @@
-/* DataMind AI - 聊天分析页（骨架 + 数据上传入口）
- * 仅走 Agnes，不提供模型选择。
- * 后端 /api/chat/send 用默认 DataAnalysisAgent（Agnes）对当前激活数据做单轮分析。
+/* DataMind AI - 聊天分析页
+ * 模型来源：用户在「API 配置」页选择的服务商 + 自定义模型。
+ * 后端 /api/chat/send 接收前端透传的 api_key/ai_provider/custom_model/custom_base_url，
+ * 任一字段为空时退回 DataAnalysisAgent 默认值（Agnes）。
+ * 数据上传走左侧「数据上传」页面；本页不再内嵌上传入口。
  * 预留 message.kind='choice' 渲染位（大脑方后续把工具 options 以选择框形式推回）。
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Send, Database, AlertTriangle, Upload, MessageSquare, Sparkles, Loader2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Send, Database, AlertTriangle, MessageSquare, Sparkles, Loader2, Info } from 'lucide-react';
 import { useData } from '../contexts/DataContext';
-import { uploadFile, listDatasets, chatSend } from '../api/client';
-import type { DatasetInfo } from '../types/api';
-import { formatBytes } from '../utils/format';
+import { listDatasets, chatSend, getChatMessages, selectDataset } from '../api/client';
 import { marked } from 'marked';
 import EtherealChart from '../components/EtherealCharts/EtherealChart';
 import ReportCard from '../components/ReportCard';
 import BigScreenCard from '../components/BigScreenCard';
+import { AI_PROVIDERS } from '../contexts/DataContext';
 
 // 与 AnalysisPage / VisualizationRenderer 一致：后端 AI 输出为 Markdown（可信源），渲染成富文本
 function renderMarkdown(text: string): string {
   return marked.parse(text || '') as string;
 }
 
-const QUOTA_DEFAULT = 30 * 1024 * 1024;
-const ACCEPT = '.csv, .xlsx, .xls, .json, .sqlite, .db';
+
 
 // 把 LLM 写的简单 chart 结构（{chart_type,x,y,data,title}）转成仙气组件认识的 chartNode
 function adaptChartToNode(chart: any) {
@@ -47,9 +46,67 @@ function adaptChartToNode(chart: any) {
   return chart; // 其余类型透传兜底
 }
 
+// 判定一个 series.data / data 是否"实际有内容"。
+// 避免把全 0 全空数组误判为可渲染（用户截图里的 "Y轴1/0.8/.../0、X轴0/0" 的怪图就是这样产生的）。
+function hasMeaningfulData(arr: any[]): boolean {
+  if (!Array.isArray(arr) || arr.length === 0) return false;
+  return arr.some((v: any) => {
+    // 对象格式（{value:0}）取 value；数组/标量直接判定
+    const n = typeof v === 'object' && v !== null ? (v as any).value : v;
+    if (n === null || n === undefined || n === '') return false;
+    const num = typeof n === 'number' ? n : Number(n);
+    return Number.isFinite(num) && num !== 0;
+  });
+}
+
+// 判定一张图表是否真正"出图了"。
+// 既看 series.data 长度，也看里面有没有非零值；空/全 0 视为空图。
+function chartIsRenderable(chart: any): boolean {
+  if (!chart) return false;
+  const seriesData = chart.series?.[0]?.data;
+  if (Array.isArray(seriesData)) {
+    if (chart.series.length === 1) {
+      return hasMeaningfulData(seriesData);
+    }
+    // 多 series：任一有数据即可（堆叠/多指标也算）
+    return chart.series.some((s: any) => hasMeaningfulData(s?.data));
+  }
+  if (Array.isArray(chart.data)) {
+    return hasMeaningfulData(chart.data);
+  }
+  return false;
+}
+
+// 从一个 tool result 中找"第一个真正能渲染的图表"
+// （generate_chart 顶层 data.chart，以及 run_template/run_analysis 包内 charts[*].option）。
+function pickRenderableChart(tr: ToolResult): { node: any; chartType: string } | null {
+  // 1) 顶层 data.chart
+  let raw: any = tr.data?.chart;
+  if (raw && !Array.isArray(raw.series)) {
+    raw = adaptChartToNode(raw);
+  }
+  const t1 = raw?.chart_type || raw?.series?.[0]?.type || (tr.data?.packages?.[0] as any)?.type;
+  if (chartIsRenderable(raw)) {
+    return { node: raw, chartType: t1 || 'unknown' };
+  }
+
+  // 2) packages[*].charts[*].option / charts[*]
+  const pkgs: any[] = tr.data?.packages || tr.data?.full_packages || [];
+  for (const pkg of pkgs) {
+    const charts: any[] = Array.isArray(pkg?.charts) ? pkg.charts : [];
+    for (const c of charts) {
+      const node = c?.option || c;
+      const normalized = node && !Array.isArray(node.series) ? adaptChartToNode(node) : node;
+      if (chartIsRenderable(normalized)) {
+        return { node: normalized, chartType: c?.chart_type || normalized?.series?.[0]?.type || 'unknown' };
+      }
+    }
+  }
+  return null;
+}
+
 // 单个工具执行结果行：图表/报告/大屏按工具类型内联渲染，不藏按钮后
 function ToolResultRow({ tr }: { tr: ToolResult }) {
-  const chart = tr.data?.chart;
   const isOk = tr.status === 'ok';
 
   // 报告 / 大屏：整块内联渲染（数据在 data.report / data.bigscreen，无 chart 字段）
@@ -60,23 +117,26 @@ function ToolResultRow({ tr }: { tr: ToolResult }) {
     return <BigScreenCard bigscreen={tr.data.bigscreen} />;
   }
 
-  // 图表：直接渲染图表本体，不显示工具名小标签（badge），让图干净呈现
-  if (chart) {
-    return (
-      <div className="mt-2">
-        <EtherealChart chartType={chart.chart_type || chart.series?.[0]?.type || tr.data?.packages?.[0]?.type} chartNode={adaptChartToNode(chart)} />
-      </div>
-    );
-  }
-
-  // 纯文字结果：保留 badge 文字框（工具名 + 摘要），用于折叠区内的提示展示
+  const picked = pickRenderableChart(tr);
   const badge = isOk ? 'bg-emerald-500/15 border border-emerald-400/40 text-emerald-700'
                      : 'bg-rose-500/15 border border-rose-400/40 text-rose-700';
+  // 有图表时只渲染可视化本体，不显示「工具名 + 执行成功」这种后台徽章；
+  // 折叠摘要（"已分析 · 点开看执行过程"）已经说明该步骤完成，没必要在每条工具下再重复"执行成功"。
+  // 报告/大屏已在前面单独渲染，不会走到这里。
+  if (picked) {
+    return (
+      <EtherealChart
+        chartType={picked.chartType}
+        chartNode={picked.node}
+        height={360}
+      />
+    );
+  }
   return (
     <div className={`text-xs rounded-lg px-2.5 py-1.5 ${badge}`}>
       <div className="flex items-start gap-2">
         <span className="font-medium shrink-0">{tr.tool}</span>
-        <span className="opacity-80">{tr.summary || (isOk ? '执行成功' : '执行失败')}</span>
+        <span className="opacity-70">{isOk ? '执行成功' : '执行失败'}</span>
       </div>
     </div>
   );
@@ -114,94 +174,126 @@ interface ChatMsg {
 
 export default function ChatPage() {
   const { state, dispatch, ensureValidSession } = useData();
-  const navigate = useNavigate();
-  const { sessionId, datasets, usedBytes, quotaBytes } = state;
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
-  const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [dragging, setDragging] = useState(false);
-  const [showUpload, setShowUpload] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
+    const { sessionId, datasets, activeDatasetId } = state;
+    // 当前对话使用的模型名：用户在「API 配置」页自填的优先；空时回落到服务商默认；
+    // 兜底是 Agnes（与后端 DataAnalysisAgent 默认值一致）。
+    const displayModel = useMemo(() => {
+      const provider = (state.aiProvider || 'agnes').toLowerCase();
+      const preset = AI_PROVIDERS.find((p) => p.id === provider);
+      const presetDefault = preset?.model ?? 'agnes-2.0-flash';
+      return (state.customModel || '').trim() || presetDefault;
+    }, [state.aiProvider, state.customModel]);
+    const [messages, setMessages] = useState<ChatMsg[]>(() => {
+      // 优先读 sessionStorage 缓存：避免切走切回 / 路由跳转 unmount→remount 后
+      // 整页对话被清空（用户认为"切回就丢"）。
+      // 按 sessionId 做 key，不同会话不会串。
+      const cached = typeof window !== 'undefined' && sessionId
+        ? sessionStorage.getItem(`chat:msgs:${sessionId}`)
+        : null;
+      if (cached) {
+        try { return JSON.parse(cached); } catch { return []; }
+      }
+      return [];
+    });
+    const [input, setInput] = useState('');
+    const [sending, setSending] = useState(false);
+    // 用 ref 记录上次同步过的 sid，避免组件内 useState 排在 useEffect 之后
+    // （违反 React hooks 顺序规则，会导致 lastSyncedSid 状态错位，
+    // 进而 sessionId 变化时早 return 跳过拉取 → 用户切回 ChatPage 看不见对话）。
+    const lastSyncedSidRef = useRef<string | null>(null);
+    const bottomRef = useRef<HTMLDivElement>(null);
 
-  const hasData = datasets.length > 0;
+    const hasData = datasets.length > 0;
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    useEffect(() => {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [messages]);
 
-  // 进入页面时同步一次数据集列表（与 UploadPage 一致）
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const res = await listDatasets(sessionId);
-        if (!alive) return;
-        dispatch({ type: 'SET_DATASETS', datasets: res.datasets });
-      } catch { /* 无数据忽略 */ }
-    })();
-    return () => { alive = false; };
-  }, [sessionId, dispatch]);
+    // 进入页面时同步一次数据集列表（与 UploadPage 一致）
+    useEffect(() => {
+      let alive = true;
+      (async () => {
+        try {
+          const res = await listDatasets(sessionId);
+          if (!alive) return;
+          dispatch({ type: 'SET_DATASETS', datasets: res.datasets });
+        } catch { /* 无数据忽略 */ }
+      })();
+      return () => { alive = false; };
+    }, [sessionId, dispatch]);
 
-  // 未上传数据时默认弹出上传入口
-  useEffect(() => {
-    if (!hasData) setShowUpload(true);
-  }, [hasData]);
+    // 进入对话页时回填历史会话：从历史会话点进来后，把 session.messages
+    // （user/assistant 纯文字对话流）灌入，恢复上次对话记录。
+    // 同时：sessionId 变化时先清空对话窗口，避免之前会话的消息
+    // 串到下一个 session 里的尴尬。
+    // 普通的「登录后新建 session」用 `assign_new_session_to_user` 会得到一个
+    // 全新 session（messages 为空），所以这里清空是安全的。
+    // 注意：这里用 ref 而不是 useState 来追踪 lastSyncedSid，避免 hooks 顺序错位
+    // （原先的 useState 排在了 useEffect 之后，违反规则）。
+    useEffect(() => {
+        if (!sessionId) return;
+        if (lastSyncedSidRef.current === sessionId) return;
+        lastSyncedSidRef.current = sessionId;
+        let alive = true;
+        // 尝试读 sessionStorage 缓存以秒级恢复（仅当 React state 已为空时，
+        // 避免覆盖用户已经在本页面看到/编辑中的消息）。
+        setMessages((prev) => {
+          if (prev.length > 0) return prev; // 已有内容（用户新对话中），不动
+          const cached = sessionStorage.getItem(`chat:msgs:${sessionId}`);
+          if (cached) {
+            try { return JSON.parse(cached); } catch { return []; }
+          }
+          return prev;
+        });
+        (async () => {
+          // 最多重试 8 次：刚恢复的会话里 session_manager 仍在 hydrate（从 DB 重建），
+          // 第一次调 /chat/messages 拿到空时不要直接放弃，否则用户进入历史会话
+          // 却看不到自己之前问过的对话。每次间隔 700ms，整体 ~5.6s 窗口。
+          for (let attempt = 0; attempt < 8; attempt++) {
+            if (!alive) return;
+            try {
+              const res = await getChatMessages(sessionId);
+              const hist: ChatMsg[] = (res.messages || [])
+                .filter((m: any) => m.role === 'user' || m.role === 'assistant')
+                .map((m: any) => ({ role: m.role, content: m.content || '' }));
+              if (hist.length) {
+                setMessages(hist);
+                return;
+              }
+              // 拿到空结果：等 hydrate 完成再重试。
+              if (attempt < 7) await new Promise((r) => setTimeout(r, 700));
+            } catch { /* 无历史忽略 */ }
+          }
+        })();
+        return () => { alive = false; };
+      }, [sessionId]);
 
-  const doUpload = useCallback(async (file: File) => {
-    setUploadError(null);
+      // 把当前会话的消息写入 sessionStorage 缓存。
+        // 这样切走切回 ChatPage（路由 unmount→remount）或临时刷新，
+        // 都能秒级恢复对话，不依赖网络 /chat/messages 拉取。
+        // 注意：只在 sessionId 已知时缓存；切走不同会话也不会被覆盖到旧 sid。
+        // 同时过滤掉 pending=true 的占位消息，避免刷新后"AI 正在分析…"加载条永远卡住。
+        useEffect(() => {
+          if (!sessionId) return;
+          try {
+            const safe = messages.filter((m) => !m.pending);
+            sessionStorage.setItem(`chat:msgs:${sessionId}`, JSON.stringify(safe));
+          } catch {
+            // sessionStorage 可能因隐私模式/配额限制抛错，忽略即可
+          }
+        }, [sessionId, messages]);
+
+  // 顶栏下拉切换数据集：调用后端 selectDataset，并同步本地 activeDatasetId
+  const handleSelectDataset = useCallback(async (datasetId: string) => {
+    if (!sessionId) return;
     try {
-      const res = await uploadFile(file, sessionId);
-      const items = (res.datasets && res.datasets.length)
-        ? res.datasets
-        : [{
-            dataset_id: res.dataset_id,
-            file_name: res.file_name ?? file.name,
-            rows: res.rows,
-            columns: res.columns,
-            memory_usage: res.memory_usage,
-            total_missing: res.total_missing,
-            duplicate_rows: res.duplicate_rows,
-            preview: res.preview,
-            column_info: res.column_info,
-            column_names: (res.column_info?.map((c: any) => c.name)) ?? [],
-          }];
-      items.forEach((d: any, i: number) => {
-        const ds: DatasetInfo = {
-          dataset_id: d.dataset_id,
-          file_name: d.file_name ?? file.name,
-          file_size_bytes: i === 0 ? res.file_size_bytes : 0,
-          rows: d.rows,
-          columns: d.column_names ?? [],
-          column_info: d.column_info,
-          preview: d.preview,
-          uploaded_at: Date.now(),
-          is_active: i === 0,
-        };
-        dispatch({ type: 'ADD_DATASET', payload: ds });
-      });
-      const usedBytes = (res.datasets ?? []).reduce(
-        (s: number, d: any, i: number) => s + (i === 0 ? (res.file_size_bytes ?? 0) : 0), 0,
-      );
-      dispatch({ type: 'SET_QUOTA', used: usedBytes, quota: quotaBytes ?? QUOTA_DEFAULT });
-      setShowUpload(false);
-    } catch (e: any) {
-      setUploadError(e?.response?.data?.detail || e?.message || '上传失败');
+      await selectDataset(sessionId, datasetId);
+    } catch (e) {
+      // 后端失败不影响本地视图；下次请求会用最新 active
+      console.warn('[ChatPage] selectDataset failed', e);
     }
-  }, [sessionId, dispatch, quotaBytes]);
-
-  const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (f) doUpload(f);
-    e.target.value = '';
-  };
-
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    const f = e.dataTransfer.files?.[0];
-    if (f) doUpload(f);
-  };
+    dispatch({ type: 'SELECT_DATASET', datasetId });
+  }, [sessionId, dispatch]);
 
   const send = useCallback(async (choiceId?: string) => {
   // 防御：choiceId 必须是字符串，否则（如对象/undefined 经异常路径传入）
@@ -220,7 +312,14 @@ export default function ChatPage() {
     return;
   }
   if (!safeChoiceId && !text) return;
-  if (!hasData) { setShowUpload(true); return; }
+  if (!hasData) {
+    setMessages((m) => [...m, {
+      role: 'assistant',
+      content: '⚠️ 当前会话还没有数据，请先到「数据上传」页面上传文件后再来对话。',
+      pending: false,
+    }]);
+    return;
+  }
 
   if (!safeChoiceId) setInput('');
   setSending(true);
@@ -239,7 +338,17 @@ export default function ChatPage() {
       setMessages((m) => m.map((x, idx) => (idx === m.length - 1 ? msg : x)));
 
     try {
-      const r = await chatSend(sessionId, safeChoiceId ? '' : text, safeChoiceId);
+      const r = await chatSend(
+        sessionId,
+        safeChoiceId ? '' : text,
+        safeChoiceId,
+        {
+          apiKey: state.apiKey,
+          aiProvider: state.aiProvider,
+          customModel: state.customModel,
+          customBaseUrl: state.customBaseUrl,
+        },
+      );
       replaceLast({
         role: 'assistant',
         content: r.content ?? '（无回复）',
@@ -275,13 +384,62 @@ export default function ChatPage() {
         <Sparkles className="w-5 h-5 text-violet-500" />
         <h1 className="text-lg font-semibold text-slate-800">DataMind AI 对话分析</h1>
         <span className="ml-2 text-xs px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-700 border border-violet-400/40">
-          模型：Agnes
+          模型：{displayModel}
         </span>
         <div className="ml-auto flex items-center gap-2 text-xs text-slate-500">
+          <span
+            className="group relative inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100/70 border border-slate-200/60 text-slate-500 cursor-help"
+            title="每个分析工具在同一轮对话内有少量调用上限（防失控熔断）。若 AI 给到前置概览就停了，可继续追问具体维度（如：按月看趋势 / 按类目看排名）引导它再调维度分析工具。"
+          >
+            <Info className="w-3 h-3" />
+            <span>工具调用上限说明</span>
+          </span>
           <Database className="w-4 h-4" />
-          {hasData
-            ? <span>{datasets[0].file_name} · {datasets[0].rows} 行</span>
-            : <button className="text-violet-600 hover:underline" onClick={() => setShowUpload(true)}>上传数据</button>}
+          {hasData ? (
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="text-xs text-slate-400 shrink-0">
+                共 {datasets.length} 张表
+                {datasets.some((d) => d.is_merged) ? (
+                  <>
+                    {' · '}
+                    <span className="text-violet-600">含 {datasets.filter((d) => d.is_merged).length} 张合并宽表</span>
+                  </>
+                ) : datasets.length >= 2 ? (
+                  <>
+                    {' · '}
+                    <span className="text-amber-600">未检测到可关联键（未生成宽表）</span>
+                  </>
+                ) : null}
+              </span>
+              <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                {datasets.map((d) => {
+                  const active = (activeDatasetId || datasets[0]?.dataset_id) === d.dataset_id;
+                  return (
+                    <button
+                      key={d.dataset_id}
+                      onClick={() => handleSelectDataset(d.dataset_id)}
+                      className={
+                        'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition ' +
+                        (active
+                          ? 'bg-violet-500/15 border-violet-400/60 text-violet-700 font-medium'
+                          : 'bg-white/60 border-slate-200/70 text-slate-600 hover:border-violet-300 hover:bg-violet-500/5')
+                      }
+                      title={d.is_merged
+                        ? `合并宽表（来自 ${(d.sources ?? []).join(', ')}；关联键 ${(d.merge_keys ?? []).join(', ')}）`
+                        : '点击切换为当前分析的数据集'}
+                    >
+                      <Database className="w-3 h-3" />
+                      {d.is_merged ? <span>🔗</span> : null}
+                      <span className="truncate max-w-[180px]">{d.file_name}</span>
+                      {d.rows ? <span className="text-slate-400">· {d.rows}</span> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <span className="text-slate-400">（当前会话暂无数据，请到「数据上传」页面上传）</span>
+          )}
         </div>
       </header>
 
@@ -290,11 +448,18 @@ export default function ChatPage() {
         {messages.length === 0 && (
           <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 gap-3">
             <MessageSquare className="w-12 h-12 text-violet-400/70" />
-            <p className="max-w-md text-slate-600">上传数据后，直接问我关于这份数据的问题，例如「有哪些列缺失？」「帮我做个趋势分析」。</p>
-            {!hasData && (
-              <button onClick={() => setShowUpload(true)} className="mt-2 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-violet-500/15 border border-violet-400/40 text-violet-700 hover:bg-violet-500/25">
-                <Upload className="w-4 h-4" /> 上传数据
-              </button>
+            {hasData ? (
+              <>
+                <p className="max-w-md text-slate-600">
+                  已上传 <b>{datasets.length}</b> 个数据集{datasets.length > 1 ? '（可在左上角下拉切换）' : ''}，向我提问吧。例如「有哪些列缺失？」「帮我做个趋势分析」{datasets.length > 1 ? '，或说「把这几张表合并关联分析」' : ''}。
+                </p>
+                <p className="text-xs text-slate-400">（这个历史会话还没生成过对话记录；开始提问后会自动保留在这里。）</p>
+              </>
+            ) : (
+              <div className="max-w-md text-slate-600">
+                <p>当前会话还没有数据，请先到「数据上传」页面上传文件后再回来对话。</p>
+                <p className="mt-2 text-xs text-slate-400">（数据上传、清洗都在左侧「数据上传」页面里完成。）</p>
+              </div>
             )}
           </div>
         )}
@@ -321,10 +486,17 @@ export default function ChatPage() {
               {m.toolResults && m.toolResults.length > 0 && (() => {
                 const ok = m.toolResults.filter((tr: ToolResult) => tr.status !== 'fail');
                 const visualResults = ok.filter(
-                  (tr: ToolResult) => tr.data?.chart || tr.data?.report || tr.data?.bigscreen,
+                  (tr: ToolResult) =>
+                    // 图/报告/大屏平铺：含 data.chart、data.report、data.bigscreen，
+                    // 以及 run_template/run_analysis 包内 charts[*].option（funnel 等），剔除全 0/空系列空图
+                    tr.data?.chart ||
+                    tr.data?.report ||
+                    tr.data?.bigscreen ||
+                    pickRenderableChart(tr) !== null,
                 );
                 const otherResults = ok.filter(
-                  (tr: ToolResult) => !(tr.data?.chart || tr.data?.report || tr.data?.bigscreen),
+                  (tr: ToolResult) => pickRenderableChart(tr) === null &&
+                    !(tr.data?.chart || tr.data?.report || tr.data?.bigscreen),
                 );
                 return (
                   <>
@@ -422,46 +594,10 @@ export default function ChatPage() {
         </div>
         {!hasData && (
           <p className="mt-2 text-xs text-amber-600 inline-flex items-center gap-1">
-            <AlertTriangle className="w-3 h-3" /> 当前会话没有数据，请先上传。
+            <AlertTriangle className="w-3 h-3" /> 当前会话没有数据，请先到「数据上传」页面上传文件。
           </p>
         )}
       </div>
-
-      {/* 上传入口弹窗 */}
-      {showUpload && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 backdrop-blur-sm" onClick={() => hasData && setShowUpload(false)}>
-          <div
-            className={`glass-card w-[520px] max-w-[92vw] rounded-2xl p-6 ${dragging ? 'ring-2 ring-violet-400' : ''}`}
-            onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={onDrop}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center gap-2 mb-4">
-              <Upload className="w-5 h-5 text-violet-500" />
-              <h2 className="text-base font-semibold text-slate-800">上传数据</h2>
-              {hasData && (
-                <button className="ml-auto text-slate-500 hover:text-slate-700" onClick={() => setShowUpload(false)}>关闭</button>
-              )}
-            </div>
-            <label className="block cursor-pointer rounded-xl border-2 border-dashed border-slate-300 hover:border-violet-400 px-6 py-10 text-center text-slate-500 transition">
-              <Upload className="w-8 h-8 mx-auto mb-2 text-violet-400/70" />
-              <p>点击或拖拽文件到此处</p>
-              <p className="text-xs mt-1 text-slate-400">支持 {ACCEPT}</p>
-              <input type="file" accept={ACCEPT} className="hidden" onChange={onPickFile} />
-            </label>
-            <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
-              <span>已用 {formatBytes(usedBytes || 0)} / {formatBytes(quotaBytes || QUOTA_DEFAULT)}</span>
-              <button className="text-violet-600 hover:underline" onClick={() => navigate('/')}>前往完整上传页</button>
-            </div>
-            {uploadError && (
-              <p className="mt-3 text-xs text-rose-600 inline-flex items-center gap-1">
-                <AlertTriangle className="w-3 h-3" /> {uploadError}
-              </p>
-            )}
-          </div>
-        </div>
-      )}
       </div>
     </div>
   );

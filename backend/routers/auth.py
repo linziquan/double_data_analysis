@@ -113,8 +113,10 @@ def login(
             # 回填失败不影响登录成功（兜底：用户仍拿到 token），仅记录日志
             logger.warning("session 回填失败 session_id=%s: %s", session_id, e)
 
-    # 没成功回填：新建一个 session 给登录用户兜底（避免空游客 session 污染历史 + 后
-    # 续上传落到 user_id=NULL 的 session 被冷启动清理）
+    # 没成功回填：永远给登录用户一个「全新」的 session。
+    # 这样用户重新登录后默认是一个干净的对话窗口，不会自动弹出旧会话。
+    # 历史会话只能通过 /history 页面显式点击恢复，避免「退出登录再次登录后
+    # 旧会话自动出现」的体验问题。
     if not final_session_id:
         final_session_id = manager.assign_new_session_to_user(user["id"])
 

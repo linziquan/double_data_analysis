@@ -237,6 +237,69 @@ def _auto_groupby(df: pd.DataFrame, x: str, y: Optional[str] = None,
 
 # ==================== 基础图表 ====================
 
+def create_funnel_chart(df: pd.DataFrame, x: str = "", y: Optional[str] = None,
+                        data: Optional[List[Dict[str, Any]]] = None,
+                        title: str = "转化漏斗", **ignored) -> Dict[str, Any]:
+    """创建漏斗图 ECharts option。
+
+    支持两种数据来源（与 create_bar_chart 对齐）：
+      - 列名方式：x=步骤名列，y=数值列（如 x="转化阶段", y="人数"）
+      - 现成 data 方式：data=[{"name": "访问", "value": 1200}, ...]
+
+    漏斗按 y/value 降序排列，更贴合"逐级流失"的直觉。
+    """
+    funnel_data: List[Dict[str, Any]] = []
+    if data and isinstance(data, list) and len(data) > 0:
+        for row in data:
+            if isinstance(row, dict) and ("name" in row or "value" in row):
+                funnel_data.append({
+                    "name": str(row.get("name", row.get("label", ""))),
+                    "value": float(row.get("value", row.get("count", 0)) or 0),
+                })
+    elif df is not None and not df.empty and x and y and x in df.columns and y in df.columns:
+        tmp = df[[x, y]].copy()
+        tmp[y] = pd.to_numeric(tmp[y], errors="coerce").fillna(0)
+        for _, r in tmp.iterrows():
+            funnel_data.append({"name": str(r[x]), "value": float(r[y])})
+
+    if not funnel_data:
+        return {}
+
+    # 按数值降序，体现逐级流失
+    funnel_data.sort(key=lambda d: d["value"], reverse=True)
+    max_val = max((d["value"] for d in funnel_data), default=1) or 1
+
+    option = {
+        **_get_default_title(title),
+        "tooltip": {**DARK_THEME["tooltip"], "trigger": "item", "formatter": "{b}: {c}"},
+        "legend": {**DARK_THEME["legend"], "data": [d["name"] for d in funnel_data]},
+        "toolbox": DARK_THEME["toolbox"],
+        "series": [
+            {
+                "name": title,
+                "type": "funnel",
+                "left": "8%",
+                "right": "8%",
+                "top": 50,
+                "bottom": 20,
+                "min": 0,
+                "max": max_val,
+                "minSize": "12%",
+                "maxSize": "100%",
+                "sort": "descending",
+                "gap": 3,
+                "label": {"show": True, "position": "inside", "color": "#0F172A",
+                          "fontSize": 12, "formatter": "{b}\n{c}"},
+                "labelLine": {"show": False},
+                "itemStyle": {"borderColor": "rgba(15,23,42,0.35)", "borderWidth": 1},
+                "emphasis": {"label": {"fontSize": 14}},
+                "data": funnel_data,
+            }
+        ],
+    }
+    return option
+
+
 def create_bar_chart(df: pd.DataFrame, x: str, y: Optional[str] = None,
                      title: str = "柱状图", color: Optional[str] = None,
                      orientation: str = "v", **ignored) -> Dict[str, Any]:
@@ -2358,6 +2421,7 @@ CHART_FUNCTIONS = {
     "cohort_trend": create_cohort_trend,
     "dual_axis": create_dual_axis,
     "ranking": create_ranking_chart,
+    "funnel": create_funnel_chart,
     # ===== RFM 专用（自包含，从数据行固定列名读取参数） =====
     "rfm_line": create_rfm_line,
     "heatmap_2d": create_heatmap_2d,

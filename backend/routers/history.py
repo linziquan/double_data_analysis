@@ -124,6 +124,13 @@ def get_sessions(user: dict = Depends(get_current_user)):
     created_at / last_access，按最后访问倒序。前端据此渲染"会话历史"列表。
     """
     sessions = crud.list_sessions_by_user(user["id"])
+    try:
+        import os, sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from backend.routers._sanitize import clean_for_json
+        sessions = clean_for_json(sessions)
+    except Exception:
+        pass
     return {"sessions": sessions}
 
 
@@ -147,6 +154,14 @@ def restore_session(session_id: str, user: dict = Depends(get_current_user)):
     # 点击进入即视为"最近操作"：刷新 last_access，使该会话在裁剪时按"最后一次使用"而非创建时间排序。
     # 例：7/1 上传、7/3 从历史点进 → 最后访问时间变为 7/3，不会被当作"最旧"清掉。
     crud.touch_session(session_id, time.time())
+    # 兜底：state 里若残留 NaN/Inf（历史脏数据），前端 json 序列化会再炸一次，这里静默净化。
+    try:
+        import os, sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from backend.routers._sanitize import clean_for_json
+        state = clean_for_json(state)
+    except Exception:
+        pass
     return {
         "session_id": session_id,
         "state": state,

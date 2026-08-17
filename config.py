@@ -40,9 +40,8 @@ import logging as _logging
 
 _jwt_secret = os.environ.get("JWT_SECRET")
 if not _jwt_secret:
-    _jwt_secret = _secrets.token_urlsafe(32)
+    _jwt_secret = "dev-secret-fixed-do-not-use-in-prod"
     _logging.getLogger(__name__).warning(
-        "JWT_SECRET 未设置，已生成临时随机密钥（仅限开发期）。"
-        "生产环境请通过环境变量 JWT_SECRET 配置固定密钥，否则重启后所有 token 失效。"
+        "JWT_SECRET 未设置，使用本地开发固定密钥。生产环境请通过环境变量 JWT_SECRET 配置固定密钥。"
     )
 JWT_SECRET = _jwt_secret

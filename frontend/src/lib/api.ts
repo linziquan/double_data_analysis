@@ -130,6 +130,8 @@ export interface HistorySession {
   last_page: string;
   dataset_count: number;
   package_count: number;
+  /** 该会话中累计的对话轮次（user+assistant 累计）。0 表示只纯数据集/分析包。 */
+  chat_count?: number;
   created_at: number;
   last_access: number;
 }

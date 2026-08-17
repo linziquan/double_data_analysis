@@ -30,6 +30,7 @@ backend/uploads/
 # 仅保留 data/.gitkeep 占位，确保目录结构进 git。
 data/
 !data/.gitkeep
+backend/datamind.db
 
 # Python virtual env
 venv/

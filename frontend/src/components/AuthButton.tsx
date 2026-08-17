@@ -82,7 +82,9 @@ const AuthButton: React.FC = () => {
             onClick={async () => {
               setOpen(false);
               await logout();
-              navigate('/');
+              // 硬刷新整页：避免任何 in-memory React state 里残留上一个用户的 datasets/API 配置
+              // 依赖 navigate 容易留下残留（UploadPage 自身的 useEffect 仍可能因旧 sessionId 再拉一次 listDatasets）。
+              window.location.href = '/';
             }}
             className="w-full flex items-center gap-2 px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
           >

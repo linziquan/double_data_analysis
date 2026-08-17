@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash  TEXT NOT NULL,
     token_version  INTEGER DEFAULT 0,
     storage_used   INTEGER DEFAULT 0,
-    dataset_limit  INTEGER DEFAULT 10,
+    dataset_limit  INTEGER DEFAULT 50,
     created_at     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);

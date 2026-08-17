@@ -379,6 +379,47 @@ class DataAnalysisAgent:
             return manager.get_dataset_df(session_id, session.active_dataset_id)
         return None
 
+    def _merge_and_register(self, manager, session_id: str, llm_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """把 session 里所有非合并数据集按关联键合并，并注册成 is_merged 宽表。
+
+        返回 {status, dataset_id?, summary, data}；无关联键/合并失败则 status='skip'，
+        不抛异常。供 _resolve_tool_call 的 merge_tables 分支与后端懒合并复用同一套逻辑。
+        """
+        session = manager.get_session(session_id)
+        if session is None:
+            return {"tool": "merge_tables", "status": "fail", "summary": "会话不存在", "data": {}}
+        non_merged = [
+            did for did, ds in session.datasets.items()
+            if not getattr(ds, "is_merged", False)
+        ]
+        pairs = [(did, manager.get_dataset_df(session_id, did)) for did in non_merged]
+        valid = [(did, df) for did, df in pairs if df is not None and not df.empty]
+        if len(valid) < 2:
+            return {"tool": "merge_tables", "status": "skip",
+                    "summary": "当前只有一个可用数据集，无需合并。", "data": {}}
+
+        from src.merge.dataset_merger import build_analysis_units
+        file_names = {did: (session.datasets[did].file_name or did) for did, _ in valid}
+        units = build_analysis_units(valid, file_names=file_names, llm_cfg=llm_cfg)
+        merged_unit = next((u for u in units if u.kind == "merged"), None)
+        if merged_unit is None or merged_unit.df is None:
+            return {"tool": "merge_tables", "status": "skip",
+                    "summary": "未检测到可关联的字段，无法自动合并（可改为手动指定关联键）。",
+                    "data": {}}
+
+        did = manager.add_merged_dataset(
+            session_id, merged_unit.df,
+            sources=merged_unit.sources, keys=merged_unit.keys,
+            file_name="合并宽表",
+        )
+        return {
+            "tool": "merge_tables", "status": "ok",
+            "summary": f"已按关联键 {merged_unit.keys} 合并 {len(merged_unit.sources)} 张表，"
+                       f"生成宽表（{merged_unit.df.shape[0]} 行 × {merged_unit.df.shape[1]} 列）。",
+            "data": {"dataset_id": did, "rows": int(merged_unit.df.shape[0]),
+                     "columns": list(merged_unit.df.columns), "keys": merged_unit.keys},
+        }
+
     def _resolve_tool_call(self, name: str, args: Dict[str, Any], manager, session_id: str,
                            user_message: str = "") -> Dict[str, Any]:
         """执行单个工具调用，返回 {tool, status, summary, data}。
@@ -390,6 +431,12 @@ class DataAnalysisAgent:
         # 注：数据侦察（profile_data）在分析对话中不再对 LLM 开放——
         # 上传时后端已自动侦察并存入 session.data_profile，且数据快照由
         # _snapshot_for_prompt 注入上下文，LLM 不需要也不能再调用侦察工具。
+
+        if name == "merge_tables":
+            # 多表自动合并：识别关联键链式 join，生成 is_merged 宽表（不抢占 active）。
+            # 合并后用户可在前端下拉里看到「合并宽表」这一选项，自由切换分析。
+            llm_cfg = self._get_llm_cfg()
+            return self._merge_and_register(manager, session_id, llm_cfg)
 
         if name == "clean_data":
             # 先判断单表/多表
@@ -495,7 +542,7 @@ class DataAnalysisAgent:
             # session.analysis_packages，供 generate_chart / build_dashboard / generate_report 读取。
             res = run_template(mapped_df, intents, manager=manager, session_id=session_id)
             return {"tool": name, "status": "ok" if res.ok else "fail",
-                    "summary": res.message or "",
+                    "summary": res.message if res.ok else (res.error or f"{name} 工具调用失败"),
                     "data": res.data if res.ok else {"error": res.error}}
 
         if name == "run_analysis":
@@ -508,7 +555,7 @@ class DataAnalysisAgent:
             from tools_registry import run_analysis
             res = run_analysis(mapped_df)
             return {"tool": name, "status": "ok" if res.ok else "fail",
-                    "summary": res.message or "",
+                    "summary": res.message if res.ok else (res.error or f"{name} 工具调用失败"),
                     "data": res.data if res.ok else {"error": res.error}}
 
         if name == "generate_chart":
@@ -524,7 +571,7 @@ class DataAnalysisAgent:
             chart_kwargs = {k: v for k, v in args.items() if k not in ("df", "chart_type")}
             res = generate_chart(mapped_df, args.get("chart_type", ""), **chart_kwargs)
             return {"tool": name, "status": "ok" if res.ok else "fail",
-                    "summary": res.message or "",
+                    "summary": res.message if res.ok else (res.error or f"{name} 工具调用失败"),
                     "data": res.data if res.ok else {"error": res.error}}
 
         if name == "run_python":
@@ -533,7 +580,7 @@ class DataAnalysisAgent:
             logger.info("run_python 入参 code=\n%s", args.get("code", ""))
             res = run_python(df, args.get("code", ""))
             return {"tool": name, "status": "ok" if res.ok else "fail",
-                    "summary": res.message or "",
+                    "summary": res.message if res.ok else (res.error or f"{name} 工具调用失败"),
                     "data": res.data if res.ok else {"error": res.error}}
 
         if name == "generate_report":
@@ -541,7 +588,7 @@ class DataAnalysisAgent:
             # 产出工具吃 session.analysis_packages（由三分析工具写入的完整 AnalysisPackage）。
             res = generate_report(manager, session_id)
             return {"tool": name, "status": "ok" if res.ok else "fail",
-                    "summary": res.message or "",
+                    "summary": res.message if res.ok else (res.error or f"{name} 工具调用失败"),
                     "data": res.data if res.ok else {"error": res.error}}
 
         if name == "build_dashboard":
@@ -549,7 +596,7 @@ class DataAnalysisAgent:
             # 产出工具吃 session.analysis_packages（由三分析工具写入的完整 AnalysisPackage）。
             res = build_dashboard(manager, session_id)
             return {"tool": name, "status": "ok" if res.ok else "fail",
-                    "summary": res.message or "",
+                    "summary": res.message if res.ok else (res.error or f"{name} 工具调用失败"),
                     "data": res.data if res.ok else {"error": res.error}}
 
         return {"tool": name, "status": "fail", "summary": f"未知工具：{name}", "data": {}}
@@ -683,6 +730,9 @@ class DataAnalysisAgent:
                 messages.append({"role": "user", "content": _CLEAN_DONE_PROMPT})
                 _need_inject_clean_prompt = False
                 print(f"[agentic_chat] round={_round} injected clean-done prompt -> auto-run 3 analysis tools")
+            _continue_count = 0
+            _MAX_CONTINUE = 2
+            _in_continue_phase = False
             try:
                 create_kwargs: Dict[str, Any] = {
                     "model": self.model,
@@ -701,13 +751,19 @@ class DataAnalysisAgent:
                     #    注意：三个分析工具写入 session.analysis_packages，产出工具（图/大屏/报告）读它作为输入。
                     def _names_eq(t, n):
                         return t.get("function", {}).get("name") == n
-                    is_cleaned = self._is_dataset_cleaned(manager, session_id)
-                    # 确定性清洗前置门禁（按用户设计）：
-                    # 未清洗时，后端读数据侦察的缺失值结论来决定放行什么工具，
-                    # 不允许 LLM 自主越级调三分析工具。
-                    #   - 有缺失值 → 只放 clean_data，由 LLM 调体检态弹框供用户点选；
-                    #   - 无缺失值 → 直接跳过清洗，放开三分析工具。
-                    # 无论哪种，未清洗轮绝不放出图/大屏/报告工具。
+                    # —— 续接总结阶段：上一轮已执行工具但 LLM 未给出完整总结。
+                    # 本轮回灌一条"请总结"提示，且强制不放任何动手工具，确保 LLM 只写文字结论，
+                    # 不再调工具导致再次中断（解决"分析到一半就断、需用户追问才继续"）。
+                    if _in_continue_phase:
+                        tools_for_round = []
+                    else:
+                        is_cleaned = self._is_dataset_cleaned(manager, session_id)
+                        # 确定性清洗前置门禁（按用户设计）：
+                        # 未清洗时，后端读数据侦察的缺失值结论来决定放行什么工具，
+                        # 不允许 LLM 自主越级调三分析工具。
+                        #   - 有缺失值 → 只放 clean_data，由 LLM 调体检态弹框供用户点选；
+                        #   - 无缺失值 → 直接跳过清洗，放开三分析工具。
+                        # 无论哪种，未清洗轮绝不放出图/大屏/报告工具。
                     if not is_cleaned:
                         _dp = getattr(manager.get_session(session_id), "data_profile", None) or {}
                         _overview = _dp.get("missing_overview") or {}
@@ -786,16 +842,55 @@ class DataAnalysisAgent:
                 ]
             messages.append(assistant_msg)
 
-            # 没有工具调用 → 直接返回最终回答
+            # 没有工具调用 → 可能是「完整最终回答」或「已执行工具但未总结完整」
             if not msg.tool_calls:
                 content = msg.content or ""
                 content = self._strip_tool_tags(content)  # 兜底：剥离可能泄露的工具标签
+
+                # 续接机制：若本轮确实执行过工具（tool_results 非空），但 LLM 给出的 content
+                # 明显不完整（没覆盖工具结论），则不直接收尾，而是补一轮强制总结。
+                # 这样避免「分析跑到一半、LLM 主动收尾文字 → 循环结束 → 用户需再追问」的问题。
+                ok_results = [tr for tr in tool_results if tr.get("status") == "ok"]
+                # 兜底：若 LLM 再次返回空 content（即使在续接轮），不再追加 prompt 避免死循环；
+                # 续接一轮后仍未拿到文字，跳出强制走 fallback 兜底，防止空白气泡。
+                if _in_continue_phase and not content.strip():
+                    _continue_count = _MAX_CONTINUE  # 锁住后续续接计数
+                _needs_continue = (
+                    not _in_continue_phase
+                    and _continue_count < _MAX_CONTINUE
+                    and bool(ok_results)
+                    and content.strip()
+                    and not self._is_complete_summary(content, ok_results)
+                )
+                if _needs_continue:
+                    _continue_count += 1
+                    _in_continue_phase = True
+                    print(f"[agentic_chat] round={_round} continue-phase: 工具已执行但总结不完整，补一轮强制总结")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你已通过工具完成分析。请现在用中文给出**完整**的总结，"
+                            "必须覆盖每一个已执行工具的分析结论（不要只写建议、不要中断）。"
+                            "不要再次调用任何工具，直接输出文字结论即可。"
+                        ),
+                    })
+                    continue  # 进入下一轮：_in_continue_phase=True → 不放工具 → LLM 纯文字总结
+
                 # 规范兜底：若 LLM 未写文字总结，但确实跑出了 ok 结果，
                 # 补一轮请求强制 LLM 基于全部结果写完整总结（不污染 messages 历史）
-                ok_results = [tr for tr in tool_results if tr.get("status") == "ok"]
                 if not content.strip() and ok_results:
                     content = self._force_summary_from_results(messages, ok_results)
                     content = self._strip_tool_tags(content)
+
+                # 最终兜底：避免把空 content 推给前端造成"空气泡"——若经过一切补刀后
+                # 仍为空，根据是否有 ok 工具结果给用户一句可见的中性说明，让前端能渲染
+                # 出文字，而不是空白消息。常见触发：模型连续多次返回空 content（超时/截断）。
+                if not content.strip():
+                    if ok_results:
+                        content = "分析已完成，详情见下方图表与执行过程。"
+                    else:
+                        content = "未能生成回复，请稍后重试或换一个问题。"
+                    print(f"[agentic_chat] round={_round} fallback: LLM 返回空 content，写入兜底文字")
                 # 判断是否是在等用户选择（上一轮有 await_choice 工具）
                 return {
                     "kind": self._classify_response(content, tool_results),
@@ -1009,23 +1104,60 @@ class DataAnalysisAgent:
     def _snapshot_for_prompt(self, manager, session_id: str) -> str:
         """生成给 LLM 的精简数据快照（来自 data_recon.scan）。
 
-        异常不再静默吞掉；当 scan 失败或 df 为 None 时，若 session.data_profile
-        已由 chat 路由写好，则降级为 data_profile 文本，确保 LLM 永远看得到数据。
+        多表支持：枚举 session 中所有非合并数据集，逐表扫描并标注来源，让 LLM 知道
+        当前存在多张表及其列结构；存在关联键时 LLM 可建议合并或用已生成的宽表分析。
+        异常不再静默吞掉；scan 失败或 df 为 None 时降级为 data_profile 文本。
         """
         try:
             from src.data_recon import scan
-            df = self._current_df(manager, session_id)
-            if df is not None:
+            session = manager.get_session(session_id)
+            if session is None:
+                return self._snapshot_from_data_profile(manager, session_id)
+
+            non_merged = [
+                did for did, ds in session.datasets.items()
+                if not getattr(ds, "is_merged", False)
+            ]
+            if len(non_merged) <= 1:
+                # 单表（或仅宽表）：走原逻辑
+                df = self._current_df(manager, session_id)
+                if df is not None:
+                    snap = scan(df)
+                    lines = [f"行数={snap['rows']}，列数={snap['column_count']}"]
+                    for c in snap["columns_detail"]:
+                        line = f"- {c['name']}（{c['kind']}，缺失{c['missing']}）"
+                        if c.get("stats"):
+                            s = c["stats"]
+                            line += f" 范围[{s.get('min')}~{s.get('max')}] 均值{s.get('mean')}"
+                        lines.append(line)
+                    return "\n".join(lines)
+                return self._snapshot_from_data_profile(manager, session_id)
+
+            # 多表：逐表扫描
+            blocks: List[str] = []
+            for did in non_merged:
+                df = manager.get_dataset_df(session_id, did)
+                if df is None or df.empty:
+                    continue
+                fname = session.datasets[did].file_name or did
                 snap = scan(df)
-                lines = [f"行数={snap['rows']}，列数={snap['column_count']}"]
+                lines = [f"【表：{fname}（dataset_id={did}）】 行数={snap['rows']}，列数={snap['column_count']}"]
                 for c in snap["columns_detail"]:
                     line = f"- {c['name']}（{c['kind']}，缺失{c['missing']}）"
                     if c.get("stats"):
                         s = c["stats"]
                         line += f" 范围[{s.get('min')}~{s.get('max')}] 均值{s.get('mean')}"
                     lines.append(line)
-                return "\n".join(lines)
-            # df 为 None：尝试用 data_profile 兜底
+                blocks.append("\n".join(lines))
+            # 若已存在合并宽表，也提示（分析时优先用宽表）
+            merged = [
+                ds for ds in session.datasets.values()
+                if getattr(ds, "is_merged", False)
+            ]
+            if merged:
+                blocks.append("【已生成合并宽表】可用 merge_tables 或直接在宽表上分析（列名已含来源前缀）。")
+            if blocks:
+                return "\n\n".join(blocks)
             return self._snapshot_from_data_profile(manager, session_id)
         except Exception as e:
             print(f"[agentic_chat] _snapshot_for_prompt failed: {type(e).__name__}: {e}")
@@ -1067,6 +1199,70 @@ class DataAnalysisAgent:
         except Exception as e:
             print(f"[agentic_chat] _snapshot_from_data_profile failed: {type(e).__name__}: {e}")
             return ""
+
+    @staticmethod
+    def _is_complete_summary(content: str, ok_results: List[Dict[str, Any]]) -> bool:        """启发式判断 LLM 的 content 是否已覆盖全部已执行工具的结论。
+
+        判断依据（任一满足即认为不完整，需要续接）：
+          1. content 过短（< 80 字）—— 明显只是建议/截断，没写完整总结；
+          2. 没有收尾词（总结/结论/综上/分析如下/整体/建议：）—— 说明还没到总结段；
+          3. 工具结论里的关键数字/关键词完全没出现在 content 中（缺覆盖）。
+        注意：这是兜底续接，配合 _MAX_CONTINUE 上限避免死循环。
+        """
+        if not content or not content.strip():
+            return False
+        text = content.strip()
+        # 1) 过短直接认为不完整
+        if len(text) < 80:
+            return False
+        # 2) 收尾词缺失 → 视为未到总结段
+        closing = ("总结", "结论", "综上", "分析如下", "整体来看", "总体", "综上所述")
+        if not any(k in text for k in closing):
+            return False
+        # 3) 关键结论关键词覆盖检查：从工具结果抽几个代表 token，看 content 是否提及
+        missing = 0
+        for tr in ok_results:
+            toks = _extract_key_tokens(tr.get("data", {}))
+            if toks:
+                # 该工具的前 3 个 token 中至少命中 1 个，才算被覆盖
+                hits = sum(1 for t in toks[:3] if t and t in text)
+                if hits == 0:
+                    missing += 1
+        # 超过半数工具结论未被覆盖 → 认为不完整
+        if ok_results and missing > len(ok_results) / 2:
+            return False
+        return True
+
+    @staticmethod
+    def _extract_key_tokens(data: Dict[str, Any]) -> List[str]:
+        """从工具结果 data 抽取代表关键词（用于判断总结是否覆盖该工具结论）。"""
+        toks: List[str] = []
+        try:
+            # 业务模型 / 自由写码：packages[].conclusion 里的名词
+            for pkg in (data.get("packages") or []):
+                concl = pkg.get("conclusion") or ""
+                # 取结论里出现的中文数字/百分比/短词片段（粗粒度）
+                for seg in str(concl).split():
+                    seg = seg.strip("，。、：；()（）")
+                    if 2 <= len(seg) <= 8:
+                        toks.append(seg)
+            # 图表：chart_type
+            if data.get("chart_type"):
+                toks.append(str(data.get("chart_type")))
+            # 通用：前几个非空的 str 值
+            for v in (data.get("rows") or [])[:3]:
+                if isinstance(v, str) and 1 < len(v) < 10:
+                    toks.append(v)
+        except Exception:
+            pass
+        # 去重保序
+        seen = set()
+        out = []
+        for t in toks:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out[:6]
 
     @staticmethod
     def _strip_tool_tags(content: str) -> str:

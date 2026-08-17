@@ -3,12 +3,13 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import {
   FiGrid, FiUpload, FiCpu, FiBarChart2, FiFileText, FiSettings, FiClock,
-  FiChevronLeft, FiChevronRight,
+  FiChevronLeft, FiChevronRight, FiMessageCircle,
 } from 'react-icons/fi';
 import { useData } from '../../contexts/DataContext';
 
 const navItems = [
   { path: '/upload', label: '数据上传', icon: FiUpload },
+  { path: '/chat', label: '智能对话', icon: FiMessageCircle },
   { path: '/models', label: 'API配置', icon: FiCpu },
   { path: '/clean', label: '数据清洗', icon: FiGrid },
   { path: '/analysis', label: '数据分析', icon: FiBarChart2 },

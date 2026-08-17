@@ -358,6 +358,12 @@ export interface DatasetInfo {
 export interface DatasetListResponse {
   success: boolean;
   datasets: DatasetInfo[];
+  used_bytes?: number;
+  quota_bytes?: number;
+  /** 该用户已上传的"数据集数" - 与字节配额并行 */
+  dataset_count?: number;
+  /** 单用户最大数据集数（登录用户才有，None 表示不限制） */
+  dataset_limit?: number | null;
   // AI 配置（整 session 一份，随 /data/datasets 一并拉回，放在 response 根级）
   api_key?: string;
   ai_provider?: string;

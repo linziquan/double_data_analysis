@@ -2,6 +2,7 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, ReactNode } from 'react';
 import { createSession, listDatasets, setSessionPage, restoreSessionHistory } from '../api/client';
 import type { ColumnInfo, DataInfo, CleaningStep } from '../types';
+import { TOKEN_KEY } from '../lib/api';
 
 // 跨 context 信号：AuthContext 登出时 dispatch 这个事件，
 // DataContext 监听后清掉本设备的 sessionId 与所有 React 内存里的业务数据，
@@ -79,6 +80,10 @@ interface DataState {
   activeDatasetId: string | null;
   usedBytes: number;
   quotaBytes: number;
+  /** 当前用户已上传的数据集数量（登录态才有意义） */
+  datasetCount: number;
+  /** 单用户数据集上限（登录态才有，游客为 null） */
+  datasetLimit: number | null;
 }
 
 type Action =
@@ -99,7 +104,7 @@ type Action =
   | { type: 'SELECT_DATASET'; datasetId: string }
   | { type: 'REMOVE_DATASET'; datasetId: string }
   | { type: 'SET_DATASETS'; datasets: DatasetInfo[] }
-  | { type: 'SET_QUOTA'; usedBytes: number; quotaBytes: number };
+  | { type: 'SET_QUOTA'; usedBytes: number; quotaBytes: number; datasetCount?: number; datasetLimit?: number | null };
 
 const initialAnalysis: AnalysisState = {
   tab: 'stats',
@@ -136,6 +141,8 @@ const initialState: DataState = {
   activeDatasetId: null,
   usedBytes: 0,
   quotaBytes: 0,
+  datasetCount: 0,
+  datasetLimit: null,
 };
 
 // 把某个数据集的字段回放到顶层（fileName/rows/columns/preview/columnInfo）
@@ -199,10 +206,16 @@ function dataReducer(state: DataState, action: Action): DataState {
       };
     }
     case 'SELECT_DATASET': {
-      const ds = state.datasets.find(d => d.dataset_id === action.datasetId);
+      const targetId = action.datasetId;
+      const datasets = state.datasets.map(d => ({
+        ...d,
+        is_active: d.dataset_id === targetId,
+      }));
+      const ds = datasets.find(d => d.dataset_id === targetId);
       return {
         ...state,
-        activeDatasetId: action.datasetId,
+        datasets,
+        activeDatasetId: targetId,
         ...replayToTop(state, ds),
       };
     }
@@ -236,7 +249,13 @@ function dataReducer(state: DataState, action: Action): DataState {
       };
     }
     case 'SET_QUOTA':
-      return { ...state, usedBytes: action.usedBytes, quotaBytes: action.quotaBytes };
+      return {
+        ...state,
+        usedBytes: action.usedBytes,
+        quotaBytes: action.quotaBytes,
+        datasetCount: action.datasetCount ?? state.datasetCount,
+        datasetLimit: action.datasetLimit === undefined ? state.datasetLimit : action.datasetLimit,
+      };
     case 'CLEAR_DATA':
       // 结束会话：清掉 localStorage 里的旧 sessionId，让 ensureValidSession 自然创建全新会话，
       // 避免沿用「已被后端 clear_data 删除」的旧 id（否则 ensureValidSession 直接返回旧 id、新会话语义失效）。
@@ -344,6 +363,46 @@ export function DataProvider({ children }: { children: ReactNode }) {
     window.addEventListener(AUTH_LOGOUT_EVENT, onLogout);
     return () => window.removeEventListener(AUTH_LOGOUT_EVENT, onLogout);
   }, [dispatch]);
+
+  // 兜底守卫：监听 localStorage 中 token 的变化（同标签页 + 跨标签页）。
+  // AuthContext 在某些 race 场景下可能只删 token 不派发 AUTH_LOGOUT_EVENT
+  // （例如初始恢复时 refresh 失败、行 48-50 仅 setToken(null) 不派事件）。
+  // 这里一旦检测到"本设备 token 缺失"且 datasets 仍非空，立即强制 CLEAR_DATA，
+  // 避免未登录态仍显示已登录用户的 session 数据。
+  // 重要：必须用 lib/api 的 TOKEN_KEY（'datamind_token'）而不是字符串 'token'，
+  // 否则这里永远监听不到 AuthContext 的增删 → 未登录态仍残留旧数据。
+  useEffect(() => {
+    let prevToken = typeof window !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
+    let didDispatch = false;
+    const check = () => {
+      const cur = localStorage.getItem(TOKEN_KEY);
+      if (prevToken && !cur && !didDispatch) {
+        // 从有 token → 无 token：等价于本设备登出
+        dispatch({ type: 'CLEAR_DATA' });
+        didDispatch = true;
+      }
+      if (cur) didDispatch = false; // 重新出现 token 时复位，等待下次"有→无"再触发
+      prevToken = cur;
+    };
+    // 跨标签页 storage 事件
+    window.addEventListener('storage', check);
+    // 同标签页轮询兜底（每 500ms 检查一次；额外开销可忽略）
+    const tick = window.setInterval(check, 500);
+    return () => {
+      window.removeEventListener('storage', check);
+      window.clearInterval(tick);
+    };
+  }, [dispatch]);
+
+  // 启动时一次性检查：如果初次进入页面时 token 就已为空（例如刷新后丢了登录态）
+  // 但 state.datasets 仍非空，则主动清空，避免把上一个会话的残留显示给登出后的用户。
+  useEffect(() => {
+    const t = typeof window !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
+    if (!t && state.datasets.length > 0) {
+      dispatch({ type: 'CLEAR_DATA' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 监听 AuthContext 派发的登录事件：把后端分配的 sessionId 同步进 React state。
   // 修复「登录后 React state.sessionId 与 localStorage.sessionId 不一致」的 bug

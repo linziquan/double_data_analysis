@@ -224,6 +224,25 @@ async def upload_file(file: UploadFile = File(...), session_id: str = Form(""),
         if not created:
             raise HTTPException(status_code=400, detail="文件内容为空或无法读取")
 
+        # 多表懒自动合并：本次上传后立刻探测 session 中所有非合并数据集，
+        # 若 ≥2 张且尚无 merged 宽表，则静默生成「合并宽表」并注册进 session。
+        # 这样用户上传两表后无需发消息，下拉里就能立即看到宽表选项（Q1=B）。
+        # 失败/无关联键静默跳过，不影响上传响应。
+        try:
+            from backend.services.multi_table import maybe_auto_merge
+            merge_result = maybe_auto_merge(manager, session_id)
+            if merge_result.get("status") == "merged":
+                import logging as _lg
+                _lg.getLogger("uvicorn.error").info(
+                    f"[upload] 多表自动合并成功: dataset_id={merge_result.get('dataset_id')} "
+                    f"keys={merge_result.get('keys')} rows={merge_result.get('rows')}"
+                )
+        except Exception as e:
+            import logging as _lg
+            _lg.getLogger("uvicorn.error").warning(
+                f"[upload] 多表自动合并探测被跳过: {type(e).__name__}: {e}"
+            )
+
         used_after = manager.get_session(session_id).uploaded_bytes
         return {
             "session_id": session_id,
