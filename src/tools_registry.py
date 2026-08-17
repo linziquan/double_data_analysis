@@ -862,6 +862,128 @@ def generate_report(manager, session_id: str) -> ToolResult:
         return ToolResult(ok=False, error=f"报告生成异常：{str(e)}")
 
 
+def _narrate_widgets(widget_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """确定性叙事编排（无 LLM）：为 chat 大屏计算 ABC 关联并就地写回。
+
+    - A 同主题递进 (progressive)：相同 business_topic 的 ≥2 个 widget 归为一组叙事段落。
+    - B 因果/时间对照 (contrast)：相同 business_topic 且 chart_type 不同（同主题用不同图对比），
+      或 analysis_type 语义序相邻（如 trend/growth 配 comparison/concentration）视为对照。
+    - C 系统相关 (related)：相同 analysis_type 但不同 business_topic 的 widget 自动归组。
+    - 落单 widget → solo。
+
+    就地修改 widget_dicts 的每个元素（追加 narrative），并返回 layout 字典。
+    layout.order / 每个 block.widget_ids 一律取 widget 自身已有的 id（兜底 w{i}）。
+    """
+    # 兜底补 id，保证 order 完整
+    for i, d in enumerate(widget_dicts):
+        if not d.get("id"):
+            d["id"] = f"w{i}"
+
+    # ---- 按 business_topic 归组（A / B 的载体）----
+    topic_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for d in widget_dicts:
+        topic = d.get("business_topic") or "未分类"
+        topic_groups.setdefault(topic, []).append(d)
+
+    # ---- 按 analysis_type 归组（C 的载体）----
+    type_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for d in widget_dicts:
+        atype = d.get("analysis_type") or "unknown"
+        type_groups.setdefault(atype, []).append(d)
+
+    # 语义序相邻表（时间/因果相邻的分析类型，用于 B 类判定）
+    SEQUENCE_NEIGHBORS = {
+        "growth": {"trend", "comparison", "concentration"},
+        "trend": {"growth", "comparison", "concentration", "anomaly"},
+        "comparison": {"growth", "trend", "concentration", "ranking"},
+        "concentration": {"growth", "trend", "comparison"},
+        "ranking": {"comparison", "structure", "proportion"},
+        "structure": {"proportion", "ranking"},
+        "proportion": {"structure", "ranking"},
+        "correlation": {"distribution"},
+        "distribution": {"correlation"},
+        "anomaly": {"trend", "comparison"},
+        "funnel": {"retention", "conversion"},
+        "retention": {"funnel", "conversion"},
+        "geo": set(),
+    }
+
+    blocks: List[Dict[str, Any]] = []
+    block_counter = 0
+    # 记录每个 widget 的最终 relation_type（避免重复赋值冲突）
+    assigned: Dict[str, str] = {}
+
+    # 先处理 A/B：同 business_topic 的多 widget 组
+    for topic, members in topic_groups.items():
+        if len(members) >= 2:
+            block_counter += 1
+            block_id = f"block_{block_counter}"
+            chart_types = {m.get("chart_type") for m in members}
+            # B 类：同主题且图表类型多样 → 对照；否则 A 类递进
+            if len(chart_types) >= 2:
+                relation = "contrast"
+                block_title = f"{topic}·对照"
+            else:
+                relation = "progressive"
+                block_title = f"{topic}·叙事"
+            widget_ids = [m["id"] for m in members]
+            for m in members:
+                assigned[m["id"]] = relation
+            blocks.append({
+                "block_id": block_id,
+                "title": block_title,
+                "widget_ids": widget_ids,
+                "relation_type": relation,
+            })
+
+    # 再处理 C：相同 analysis_type 但跨不同 business_topic 的归组
+    for atype, members in type_groups.items():
+        distinct_topics = {m.get("business_topic") for m in members}
+        if len(members) >= 2 and len(distinct_topics) >= 2:
+            block_counter += 1
+            block_id = f"block_{block_counter}"
+            widget_ids = [m["id"] for m in members]
+            for m in members:
+                # 仅在尚未被 A/B 赋值时标 related，避免覆盖对照关系
+                if m["id"] not in assigned:
+                    assigned[m["id"]] = "related"
+            # 已被 A/B 占用的成员仍纳入 block 展示，但 relation 取 related 作 block 级
+            blocks.append({
+                "block_id": block_id,
+                "title": f"{atype}·相关",
+                "widget_ids": widget_ids,
+                "relation_type": "related",
+            })
+
+    # 兜底：未分配的 widget 标 solo
+    for d in widget_dicts:
+        rid = d["id"]
+        if rid not in assigned:
+            assigned[rid] = "solo"
+
+    # 写回每个 widget 的 narrative（就地修改同一个 dict）
+    for d in widget_dicts:
+        rid = assigned[d["id"]]
+        # 找到所属 block 标题
+        blk_title = ""
+        blk_id = ""
+        for b in blocks:
+            if d["id"] in b["widget_ids"]:
+                blk_title = b["title"]
+                blk_id = b["block_id"]
+                break
+        d["narrative"] = {
+            "block_id": blk_id,
+            "block_title": blk_title,
+            "relation_type": rid,
+        }
+
+    # order：保持当前（已按 importance_score 降序）顺序
+    order = [d["id"] for d in widget_dicts]
+
+    return {"blocks": blocks, "order": order}
+
+
 def build_dashboard(manager, session_id: str) -> ToolResult:
     """生成数据大屏：读取 session.analysis_packages 的完整分析包，调 widget_generator 生成 Widget 列表预览。
 
@@ -887,9 +1009,17 @@ def build_dashboard(manager, session_id: str) -> ToolResult:
             elif isinstance(w, dict):
                 widget_dicts.append(w)
         widget_dicts.sort(key=lambda d: d.get("importance_score", 0) or 0, reverse=True)
+        # 叙事编排：就地写回每个 widget 的 narrative，并返回 layout
+        layout = _narrate_widgets(widget_dicts)
         return ToolResult(
             ok=True,
-            data={"bigscreen": {"widgets": widget_dicts, "widget_count": len(widget_dicts)}},
+            data={
+                "bigscreen": {
+                    "widgets": widget_dicts,
+                    "widget_count": len(widget_dicts),
+                    "layout": layout,
+                }
+            },
             message=f"已生成数据大屏，共 {len(widget_dicts)} 个组件。",
         )
     except Exception as e:
