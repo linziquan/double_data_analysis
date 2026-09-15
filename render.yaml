@@ -1,14 +1,45 @@
-# Render 部署配置
-# 重要：在 Render 创建 Web Service 时，Root Directory 留空（即整个仓库根），
-# 下面的命令已显式 cd backend，无需在 Render 里单独设置子目录。
+# Render 部署配置（Blueprint）
+#
+# 架构：两个 Render 服务，同属一个 Blueprint
+#   1. data-analysis      —— 后端 FastAPI（Python）
+#   2. data-analysis-web  —— 前端静态站（Vite 构建产物，走 Render 全球 CDN）
+#
+# 访客只使用「前端静态站」的网址；前端页面里的 API 请求按 VITE_API_BASE
+# （见 frontend/.env.production，已入库）打向后端服务，使用者无感知。
+#
+# 重要：两个服务都从「仓库根目录」构建，命令里已显式 cd 到子目录，
+#       因此在 Render 后台新建服务时 Root Directory 必须留空。
+#
 services:
+
+  # ---------------- 后端：FastAPI ----------------
   - type: web
     name: data-analysis
     runtime: python
     plan: free
-    # 后端依赖在 backend/requirements.txt
+    # 后端依赖清单
     buildCommand: pip install -r backend/requirements.txt
-    # 进入 backend 目录后用 uvicorn 启动（main.py 已把项目根加入 sys.path，backend 相对导入可正常工作）
+    # 进入 backend 后启动（main.py 已把项目根加入 sys.path，backend 相对导入可正常工作）
     startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
-    autoDeploy: true
+    # 注：autoDeploy 字段官方已废弃，改用 autoDeployTrigger
+    autoDeployTrigger: commit
+
+  # ---------------- 前端：Vite 静态站 ----------------
+  - type: web
+    runtime: static
+    name: data-analysis-web
+    buildCommand: cd frontend && npm ci && npm run build
+    # 构建产物目录（相对仓库根）
+    staticPublishPath: frontend/dist
+    # SPA 回退：所有路径重写到 index.html，否则刷新子路由会 404
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    autoDeployTrigger: commit
+    envVars:
+      # 依赖由上面 buildCommand 里的 npm ci 负责，
+      # 避免 Render 自动检测依赖时在仓库根找不到 package.json 而失败
+      - key: SKIP_INSTALL_DEPS
+        value: "true"
