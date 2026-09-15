@@ -152,22 +152,35 @@ TYPE_OPTIONS_META: Dict[str, Dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 # Agnes 结构化 JSON 调用（不复用 agent.analyze，独立走 JSON-only 协议）
 # ---------------------------------------------------------------------------
-def _get_agnes_client():
+def _get_agnes_client(llm_cfg: Optional[Dict[str, str]] = None):
     """复用 agent.py 的 Agnes 客户端构造（model/base_url/key 读取逻辑）。
 
-    返回 (client, model)。若环境无 AGNES_API_KEY，则抛错交由调用方捕获回退。
+    返回 (client, model)。
+    - 传入 llm_cfg（含 api_key/base_url/model，来自用户在 API 配置页的选择）时，
+      用用户的配置构造客户端 —— 让工具内部的 LLM 调用跟随前端配置，而非写死 .env。
+    - 未传 llm_cfg 时退回旧行为：读 os.environ["AGNES_API_KEY"]，空则抛 ValueError，
+      由调用方捕获回退。
     """
     from src.ai_agent.agent import DataAnalysisAgent
-    agent = DataAnalysisAgent()  # 内部读 os.environ["AGNES_API_KEY"]，空则抛 ValueError
+    if llm_cfg and llm_cfg.get("api_key"):
+        agent = DataAnalysisAgent(
+            api_key=llm_cfg["api_key"],
+            model=(llm_cfg.get("model") or "").strip() or "agnes-2.0-flash",
+            base_url=(llm_cfg.get("base_url") or "").strip() or "https://apihub.agnes-ai.com/v1",
+        )
+    else:
+        agent = DataAnalysisAgent()  # 内部读 os.environ["AGNES_API_KEY"]，空则抛 ValueError
     return agent.client, agent.model
 
 
-def _call_agnes_json(system_prompt: str, user_prompt: str, timeout: float = 60.0) -> Dict[str, Any]:
-    """调 Agnes 并要求只返回 JSON，解析失败抛异常（由调用方回退确定性规则）。
+def _call_agnes_json(system_prompt: str, user_prompt: str, timeout: float = 60.0,
+                     llm_cfg: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """调 LLM（默认 Agnes）并要求只返回 JSON，解析失败抛异常（由调用方回退确定性规则）。
 
     不复用 analyze（analyze 被禁止结构化输出），这里独立发 chat.completions。
+    llm_cfg 透传用户配置，让工具内调用跟随前端选择。
     """
-    client, model = _get_agnes_client()
+    client, model = _get_agnes_client(llm_cfg)
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -214,11 +227,13 @@ def _scan_and_recommend(
     df: pd.DataFrame,
     missing_cols: List[str],
     missing_detail: Dict[str, int],
+    llm_cfg: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """体检态调 Agnes 生成【一个全局缺失填充推荐策略 + 整体理由 + 4 种备选】。
+    """体检态调 LLM 生成【一个全局缺失填充推荐策略 + 整体理由 + 4 种备选】。
 
     成功返回 {"strategy": str, "reason": str, "alternatives": [...]}；
     任何异常（无 key / 超时 / 非 JSON / 字段缺失）→ 返回 None，由调用方走兜底甲。
+    llm_cfg 透传用户配置（来自前端 API 配置页）。
     """
     try:
         # 构造给 LLM 的数据画像：列名、类型、缺失数、每列前 5 行样本（截断 token）
@@ -256,7 +271,7 @@ def _scan_and_recommend(
             "请输出全局统一填充策略的推荐 JSON。"
         )
 
-        result = _call_agnes_json(system_prompt, user_prompt)
+        result = _call_agnes_json(system_prompt, user_prompt, llm_cfg=llm_cfg)
         # 容错：LLM 可能用不同 key 返回策略名
         strategy = (
             result.get("recommended_method")
@@ -343,11 +358,12 @@ def _fallback_recommend(
 # ---------------------------------------------------------------------------
 # 类型转换：LLM 自动推断 + 兜底（确定性 detect_data_type_issues）
 # ---------------------------------------------------------------------------
-def _infer_types_via_llm(df: pd.DataFrame) -> Optional[Dict[str, str]]:
-    """执行态调 Agnes 推断每列目标类型，返回 {列名: target_type}。
+def _infer_types_via_llm(df: pd.DataFrame, llm_cfg: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
+    """执行态调 LLM 推断每列目标类型，返回 {列名: target_type}。
 
     失败（无 key / 超时 / 非 JSON）→ 返回 None，由调用方走确定性兜底。
     target_type 只能是 datetime/numeric/string/category 之一，其余丢弃。
+    llm_cfg 透传用户配置（来自前端 API 配置页）。
     """
     try:
         col_profiles = []
@@ -370,7 +386,7 @@ def _infer_types_via_llm(df: pd.DataFrame) -> Optional[Dict[str, str]]:
         user_prompt = (
             f"数据集列画像（JSON）：\n{data_json}\n\n请输出类型转换映射 JSON。"
         )
-        result = _call_agnes_json(system_prompt, user_prompt, timeout=60.0)
+        result = _call_agnes_json(system_prompt, user_prompt, timeout=60.0, llm_cfg=llm_cfg)
         if not isinstance(result, dict):
             return None
         valid = {"datetime", "numeric", "string", "category"}
@@ -397,12 +413,13 @@ def _fallback_types(df: pd.DataFrame) -> Dict[str, str]:
     return mapping
 
 
-def clean_data(df: pd.DataFrame, actions: Optional[List[Dict[str, Any]]] = None) -> ToolResult:
+def clean_data(df: pd.DataFrame, actions: Optional[List[Dict[str, Any]]] = None,
+               llm_cfg: Optional[Dict[str, str]] = None) -> ToolResult:
     """数据清洗工具（七工具箱之一），三态：
 
     1) 空 df：ok=False，reason 说明。
-    2) 体检态（actions 为 None）：确定性扫描缺失值 + 类型问题，调 Agnes 生成
-       【一个全局缺失填充推荐策略 + 整体理由 + 4 种备选】；Agnes 失败则兜底甲。
+    2) 体检态（actions 为 None）：确定性扫描缺失值 + 类型问题，调 LLM 生成
+       【一个全局缺失填充推荐策略 + 整体理由 + 4 种备选】；失败则兜底甲。
        类型问题也一并返回供参考（但类型转换在执行态由 LLM 自动完成，用户无感）。
     3) 执行态（actions 提供 method）：对所有缺失列统一应用该 method，
        并自动执行类型转换（LLM 推断，失败兜底确定性），返回新 df（不覆盖入参）。
@@ -411,6 +428,10 @@ def clean_data(df: pd.DataFrame, actions: Optional[List[Dict[str, Any]]] = None)
       {"method": "fill_median"}            # 全局统一应用到所有缺失列
 
     类型转换不进用户选项，由工具在执行态内部自动完成。
+
+    llm_cfg：透传用户在 API 配置页选的 {api_key, base_url, model}。
+    工具内部的推荐/类型推断必须跟随用户配置，不能写死读 .env ——
+    否则前端换 key 后清洗推荐仍报"AI 不可用"（后端 .env 旧 key 失效）。
     """
     # ---- 边界：空 df ----
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
@@ -452,7 +473,7 @@ def clean_data(df: pd.DataFrame, actions: Optional[List[Dict[str, Any]]] = None)
                 failed.append(f"{col}: {str(e)}")
 
         # 类型转换：LLM 自动推断（失败兜底确定性）
-        type_mapping = _infer_types_via_llm(df_new)
+        type_mapping = _infer_types_via_llm(df_new, llm_cfg=llm_cfg)
         type_source = "llm"
         if type_mapping is None:
             type_mapping = _fallback_types(df_new)
@@ -493,8 +514,8 @@ def clean_data(df: pd.DataFrame, actions: Optional[List[Dict[str, Any]]] = None)
 
     type_issues = detect_data_type_issues(df)
 
-    # 调 Agnes 生成全局缺失填充推荐（失败 → 兜底甲）
-    recommendation = _scan_and_recommend(df, missing_cols, missing_detail)
+    # 调 LLM 生成全局缺失填充推荐（失败 → 兜底甲）
+    recommendation = _scan_and_recommend(df, missing_cols, missing_detail, llm_cfg=llm_cfg)
     rec_source = "llm"
     if recommendation is None:
         recommendation = _fallback_recommend(df, missing_cols, missing_detail)
@@ -833,12 +854,25 @@ def generate_report(manager, session_id: str) -> ToolResult:
     try:
         # generate_report_from_packages 在 agent.py 内，延迟导入避免循环依赖。
         from ai_agent.agent import DataAnalysisAgent
-        # generate_report_from_packages 是 DataAnalysisAgent 实例方法。缓存单例，避免每次调用重复构造。
-        # 构造仅读环境变量 AGNES_API_KEY，不触发网络；报告内的 LLM 调用在方法内部按需发生。
-        _agent = getattr(generate_report, "_agent_cache", None)
-        if _agent is None:
-            _agent = DataAnalysisAgent()
-            generate_report._agent_cache = _agent
+        from ai_agent.llm_providers import resolve_llm_config
+        # ★ 关键：报告的 LLM 调用必须使用「用户在 API 配置页选择的」服务商/Key，
+        #   而不是写死 Agnes。写死会导致用户配了 deepseek 却仍用 Agnes 的 Key → 401
+        #   → 报告生成失败降级为纯统计汇总（用户实测 bug）。
+        session = manager.get_session(session_id)
+        _api_key = (getattr(session, "api_key", "") or "").strip()
+        _resolved = resolve_llm_config(
+            getattr(session, "ai_provider", "") or "",
+            getattr(session, "custom_model", "") or "",
+            getattr(session, "custom_base_url", "") or "",
+        )
+        try:
+            _agent = DataAnalysisAgent(
+                api_key=_api_key or None,
+                model=_resolved["model"],
+                base_url=_resolved["base_url"],
+            )
+        except ValueError as _e:
+            return ToolResult(ok=False, error=f"生成报告需要可用的 AI Key：{_e}")
         result = _agent.generate_report_from_packages(packages, data_profile=None)
         sections = result.get("sections") or []
         title = result.get("report_title") or "数据分析报告"

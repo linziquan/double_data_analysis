@@ -8,10 +8,6 @@ import { useData } from '../contexts/DataContext';
 const PAGE_ROUTE: Record<string, string> = {
   chat: '/chat',
   upload: '/upload',
-  clean: '/clean',
-  analysis: '/analysis',
-  dashboard: '/dashboard',
-  reports: '/reports',
   models: '/models',
   settings: '/settings',
   profile: '/profile',

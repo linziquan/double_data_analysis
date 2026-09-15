@@ -61,31 +61,16 @@ class ChatRequest(BaseModel):
 LEGAL_METHODS = {"fill_mean", "fill_median", "fill_mode", "fill_0"}
 
 
-# AI 服务商白名单 + 默认模型/base_url，必须与 frontend/src/contexts/DataContext.tsx
-# 里的 AI_PROVIDERS 保持同步。新增服务商时记得两边同步。
-_LLM_PROVIDERS = {
-    "ppio":      {"base_url": "https://api.ppio.ai/v1",          "model": "deepseek-chat"},
-    "deepseek":  {"base_url": "https://api.deepseek.com",        "model": "deepseek-chat"},
-    "qwen":      {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen3.7-plus"},
-    "zhipu":     {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash"},
-    "moonshot":  {"base_url": "https://api.moonshot.cn/v1",       "model": "moonshot-v1-8k"},
-    "openai":    {"base_url": "https://api.openai.com/v1",        "model": "gpt-4o-mini"},
-    "agnes":     {"base_url": "https://apihub.agnes-ai.com/v1",   "model": "agnes-2.0-flash"},
-}
+# AI 服务商映射已收敛到 src/ai_agent/llm_providers.py（SSOT），与报告等工具内部的
+# LLM 调用共用，避免「聊天用 deepseek、报告却写死 Agnes」导致报告 401 降级。
+# 该映射仍需与 frontend/src/contexts/DataContext.tsx 的 AI_PROVIDERS 保持同步。
+from src.ai_agent.llm_providers import LLM_PROVIDERS as _LLM_PROVIDERS  # noqa: F401
+from src.ai_agent.llm_providers import resolve_llm_config
 
 
 def _resolve_chat_llm(ai_provider: Optional[str], custom_model: Optional[str], custom_base_url: Optional[str]) -> Dict[str, str]:
-    """根据用户传参解析本次对话使用的 (model, base_url)。
-
-    优先级：custom_model > 服务商默认 model；custom_base_url > 服务商默认 base_url；
-    ai_provider 未识别时直接退回 Agnes（与 DataAnalysisAgent 构造函数默认值一致）。
-    """
-    provider = (ai_provider or "agnes").lower()
-    preset = _LLM_PROVIDERS.get(provider, _LLM_PROVIDERS["agnes"])
-    return {
-        "model": (custom_model or "").strip() or preset["model"],
-        "base_url": (custom_base_url or "").strip() or preset["base_url"],
-    }
+    """根据用户传参解析本次对话使用的 (model, base_url)（委托共享 SSOT）。"""
+    return resolve_llm_config(ai_provider, custom_model, custom_base_url)
 
 
 @router.post("/chat/send")
@@ -100,6 +85,12 @@ async def api_chat_send(req: ChatRequest):
     session = manager.get_session(req.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="会话不存在")
+    # 诊断日志（定位"配置了 key 仍 AI 不可用"）：打印每次聊天请求前端到底传了什么
+    print(
+        f"[chat/send] session={req.session_id[:8]} provider={req.ai_provider!r} "
+        f"api_key={((req.api_key or '')[:6] + '...') if req.api_key else 'None'} "
+        f"model={req.custom_model!r} base_url={((req.custom_base_url or '')[:30] + '...') if req.custom_base_url else 'None'}"
+    )
     if not session.datasets:
         raise HTTPException(status_code=404, detail="请先上传数据：当前会话没有可用数据集")
 
@@ -147,6 +138,21 @@ async def api_chat_send(req: ChatRequest):
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    # 把本次请求携带的 AI 配置持久化到会话：报告等「工具内部 LLM 调用」需要从会话
+    # 读取用户所选 provider/key，否则会回退默认 Agnes 的 key → 401 → 报告降级为「纯汇总」。
+    # 仅在用户本次带了新配置时写入，避免把会话里已有配置覆盖成空。
+    try:
+        if req.api_key or req.ai_provider:
+            manager.set_api_config(
+                req.session_id,
+                req.api_key or (getattr(session, "api_key", "") or ""),
+                req.ai_provider or (getattr(session, "ai_provider", "") or ""),
+                req.custom_model or (getattr(session, "custom_model", "") or ""),
+                req.custom_base_url or (getattr(session, "custom_base_url", "") or ""),
+            )
+    except Exception as e:
+        print(f"[chat/send] 持久化 AI 配置失败（不影响本轮对话）：{type(e).__name__}: {e}")
+
     # 多轮：若用户点了 choice，把选择拼进消息；并恢复历史
     # 防御：只有属于 LEGAL_METHODS 的合法 method 才走"选择续接 + 执行清洗"分支；
     # 其余（含 [object Object] 等垃圾字符串）一律当普通消息处理，避免误执行清洗。
@@ -181,11 +187,24 @@ async def api_chat_send(req: ChatRequest):
         or result.get("answer")
         or ""
     )
-    # 把 user/assistant 也写进 session.messages（多轮续接需要）
-    if req.message and req.message.strip():
-        session.messages.append({"role": "user", "content": req.message})
+    # 【修 bug】第 171 行已经把本轮 user 写进了 session.messages（agentic_chat 内部
+    # 把 user 消息 append 进 messages，sanitize 后仍保留）。这里【不能再 append user】，
+    # 否则会重复成两个 user 气泡。
+    # 同时清理 sanitize 后残留的「空 assistant」——LLM 调工具那一轮的 assistant
+    # content 为空，sanitize 只去掉了 tool_calls，会留下一条空白的 assistant 气泡。
+    # 最终 assistant 文字（尤其 await_choice 场景的"发现 N 列缺失值…"）在
+    # result["content"] 里、不在 messages 的 assistant 中，所以这里只补它。
+    session.messages = [
+        m for m in session.messages
+        if not (m.get("role") == "assistant" and not (m.get("content") or "").strip())
+    ]
     if assistant_content:
-        session.messages.append({"role": "assistant", "content": assistant_content})
+        # 去重：若 sanitize 后最后一条已是相同 content 的 assistant（LLM 调工具前
+        # 自己写了文字，如"发现 N 列缺失值…"），就不再重复 append；只有清理掉
+        # 空 assistant、或 messages 末尾不是 assistant 时才补最终文字。
+        _last = session.messages[-1] if session.messages else None
+        if not _last or _last.get("role") != "assistant" or _last.get("content") != assistant_content:
+            session.messages.append({"role": "assistant", "content": assistant_content})
 
     # 历史会话记录的硬要求：用户发了问 → 必须有记录。
     # append_history 内部已 try/except 锁住，不会让请求失败。
@@ -237,13 +256,37 @@ async def api_chat_messages(session_id: str):
     # 此时退回到 session.chat_history（持久化字段，每条形如 {role, content, ts}），
     # 它的 role 只有 user/assistant，正好回填历史会话。
     msgs = session.messages or []
-    msgs = [m for m in msgs if m.get("role") in ("user", "assistant")]
+    # 过滤系统内部消息（打 _system_injected 标记的系统注入提示，如"数据已清洗完成
+    # 请立即调用三分析工具"）与 LLM 调工具前的开场白（_preamble，如 "I'll run the
+    # three analysis tools now."）。它们只服务 LLM 上下文，不该渲染成用户/助手气泡。
+    # session.messages 本体保留这些消息：_clean_prompt_in_ctx 门禁判断依赖注入提示存在。
+    msgs = [
+        m for m in msgs
+        if m.get("role") in ("user", "assistant")
+        and not m.get("_system_injected")
+        and not m.get("_preamble")
+    ]
     source = "messages"
     if not msgs:
         ch = session.chat_history or []
         msgs = [{"role": h.get("role"), "content": h.get("content", "")}
                 for h in ch if h.get("role") in ("user", "assistant")]
         source = "chat_history"
+    # 挂起的清洗选择：上一轮弹了填充方式选项框但用户还没选。
+    # 历史流是纯文字的，choices 不会随消息持久化，导致刷新后只剩一句
+    # 「发现 N 列缺失值」却没有按钮可点。这里把挂起状态补成一条带 choices 的
+    # assistant 消息，前端即可原样渲染出选择按钮。
+    try:
+        pending = (session.data_profile or {}).get("pending_clean")
+    except Exception:
+        pending = None
+    if pending and pending.get("choices"):
+        msgs = list(msgs) + [{
+            "role": "assistant",
+            "content": pending.get("summary") or "请选择缺失值填充方式：",
+            "choices": pending.get("choices"),
+        }]
+
     return sanitize_json({
         "success": True,
         "session_id": session_id,

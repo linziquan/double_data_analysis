@@ -6,12 +6,8 @@ import { AuthProvider } from './context/AuthContext';
 import Layout from './components/Layout/Layout';
 import RequireAuth from './components/RequireAuth';
 import UploadPage from './pages/UploadPage';
-import CleanPage from './pages/CleanPage';
-import AnalysisPage from './pages/AnalysisPage';
-import DashboardPage from './pages/DashboardPage';
 import EtherealPreview from './EtherealPreview';
 import AIModelsPage from './pages/AIModelsPage';
-import ReportsPage from './pages/ReportsPage';
 import SettingsPage from './pages/SettingsPage';
 import CoverPage from './pages/CoverPage';
 import ChatPage from './pages/ChatPage';
@@ -53,17 +49,17 @@ export default function App() {
               {/* 智能对话：嵌入侧边栏框架，与「数据上传」共享 DataContext */}
               <Route path="/chat" element={<ChatPage />} />
               <Route path="/upload" element={<UploadPage />} />
-              <Route path="/clean" element={<CleanPage />} />
-              <Route path="/analysis" element={<AnalysisPage />} />
-              <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/ethereal-preview" element={<EtherealPreview />} />
               <Route path="/models" element={<AIModelsPage />} />
-              <Route path="/reports" element={<ReportsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               {/* 需登录的页面，套 RequireAuth 守卫 */}
               <Route path="/profile" element={<RequireAuth><ProfilePage /></RequireAuth>} />
               <Route path="/history" element={<RequireAuth><HistoryPage /></RequireAuth>} />
             </Route>
+            {/* 兜底：未知路径（含已删除的 /clean、/analysis、/dashboard 及任意错误输入）
+                重定向回封面。react-router 匹配不到路由时会渲染空白页且不报错，
+                必须显式兜底，否则用户停在旧路径刷新就是白屏。 */}
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </DataProvider>
       </AuthProvider>

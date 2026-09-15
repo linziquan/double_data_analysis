@@ -203,7 +203,12 @@ export const EtherealChart: React.FC<Props> = ({ slot, chartType, chartNode, dat
           </div>
         );
       }
-      return <EChartView option={opt as never} title={title} hideTitle />;
+      return <EChartView
+        option={opt as never}
+        title={title}
+        hideTitle
+        height={typeof wrapperHeight === 'number' ? wrapperHeight : 400}
+      />;
     }
   }
 };

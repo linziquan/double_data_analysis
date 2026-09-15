@@ -15,6 +15,8 @@ interface ChartWidgetProps {
   isCrossFilterSource?: boolean;
   hasDrillDown?: boolean;
   onDrillDown?: (widgetId: string, dimension: string, nextLevel: string) => void;
+  /** 尺寸缩放系数（全屏大屏模式传 >1 的值放大图表高度），默认 1 */
+  sizeScale?: number;
 }
 
 /**
@@ -24,7 +26,7 @@ interface ChartWidgetProps {
  * 后端只负责决定 chart_type / data / option，渲染层统一靠 EtherealChart 派发，
  * 不再落到裸 ECharts（参考 EtherealChart.tsx 第 195 行：fallback 路径会丢仙气渐变）。
  */
-export const ChartWidget: React.FC<ChartWidgetProps> = memo(({ widget, onClick, hasDrillDown, onDrillDown }) => {
+export const ChartWidget: React.FC<ChartWidgetProps> = memo(({ widget, onClick, hasDrillDown, onDrillDown, sizeScale = 1 }) => {
   const theme = useDashboardTheme();
 
   // Animation
@@ -46,19 +48,26 @@ export const ChartWidget: React.FC<ChartWidgetProps> = memo(({ widget, onClick, 
   const slot = widget.widget_id || 'chart';
 
   // 高度：与 widget.preferred_size 对齐，与 Ethereal 子组件默认值一致
+  // sizeScale > 1（全屏大屏模式）时按比例放大，摆脱对话内 220px 小图
   const height = useMemo<number | string>(() => {
+    let base: number;
     switch (widget.preferred_size) {
       case 'HERO':
-        return 360;
+        base = 360;
+        break;
       case 'LARGE':
-        return 300;
+        base = 300;
+        break;
       case 'MEDIUM':
-        return 260;
+        base = 260;
+        break;
       case 'SMALL':
       default:
-        return 220;
+        base = 220;
+        break;
     }
-  }, [widget.preferred_size]);
+    return Math.round(base * sizeScale);
+  }, [widget.preferred_size, sizeScale]);
 
   // Drill Down
   const handleDrillDownClick = () => {
@@ -73,7 +82,7 @@ export const ChartWidget: React.FC<ChartWidgetProps> = memo(({ widget, onClick, 
   if (!chartNode || Object.keys(chartNode).length === 0) {
     return (
       <div ref={animRef}
-        className={`${theme.cardBg} ${theme.cardBorder} border rounded-xl p-4 ${animationClass}`}
+        className={`relative p-4 ${animationClass}`}
         style={animationStyle}
         onClick={() => onClick?.(widget.widget_id, {})}
       >
@@ -86,11 +95,9 @@ export const ChartWidget: React.FC<ChartWidgetProps> = memo(({ widget, onClick, 
 
   return (
     <div ref={animRef}
-      className={`${theme.cardBg} ${theme.cardBorder} border rounded-xl db-transition
-        ${animationClass} hover:border-opacity-100 ${theme.shadow}`}
+      className={`relative ${animationClass}`}
       style={{
         padding: theme.cardPadding,
-        borderRadius: theme.borderRadius,
         ...animationStyle,
       }}
       onClick={() => onClick?.(widget.widget_id, {})}
@@ -125,12 +132,8 @@ export const ChartWidget: React.FC<ChartWidgetProps> = memo(({ widget, onClick, 
           height={height}
         />
       )}
-
-      {widget.description ? (
-        <p className={`mt-2 text-xs leading-relaxed ${theme.textSecondary} opacity-80`}>
-          {widget.description}
-        </p>
-      ) : null}
+      {/* 图表下方不再渲染 description 文字说明（用户要求大屏只有图表，
+          文字堆在图下会让大屏看起来像图表列表的堆砌） */}
     </div>
   );
 });

@@ -26,6 +26,7 @@ export const AI_PROVIDERS: AiProviderConfig[] = [
   { id: 'moonshot', name: 'Moonshot / Kimi', baseUrl: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
   { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
   { id: 'agnes', name: 'Agnes AI', baseUrl: 'https://apihub.agnes-ai.com/v1', model: 'agnes-2.0-flash' },
+  { id: 'opencodex', name: 'OpenCodex', baseUrl: 'https://openrouter.ai/api/v1', model: 'stealth/ox-alpha' },
 ];
 
 export interface DatasetInfo {

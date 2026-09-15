@@ -232,6 +232,14 @@ class ReportBuilder:
                     "x": str(c.get("x", "")),
                     "y": str(c.get("y", "")),
                     "data_count": len(c.get("data", [])) if isinstance(c.get("data"), list) else 0,
+                    # 渲染原料字段：报告链路会用 ChartRenderer 把缺 option 的图现场
+                    # 渲染成 ECharts option，data/color/right_col/chart_config 是
+                    # ChartData→option 的必需输入。_format_prompt_input 只挑选
+                    # title/type/x/y/data_count，这些字段不会进 prompt 文本（token 不变）。
+                    "data": c.get("data") if isinstance(c.get("data"), list) else [],
+                    "color": str(c.get("color", "")),
+                    "right_col": str(c.get("right_col", "")),
+                    "chart_config": c.get("chart_config") if isinstance(c.get("chart_config"), dict) else {},
                     "option": c.get("option"),
                     "raw_data": c.get("raw_data"),
                     "role": c.get("role", ""),

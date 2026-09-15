@@ -202,6 +202,9 @@ export default function ChatPage() {
     });
     const [input, setInput] = useState('');
     const [sending, setSending] = useState(false);
+    // 同步发送锁：useRef 不受 useCallback 闭包旧值影响，连点时能真正拦截，
+    // 避免两条 user 消息被重复追加、以及 replaceLast 误覆盖已完成的 choice 消息。
+    const sendingRef = useRef(false);
     // 用 ref 记录上次同步过的 sid，避免组件内 useState 排在 useEffect 之后
     // （违反 React hooks 顺序规则，会导致 lastSyncedSid 状态错位，
     // 进而 sessionId 变化时早 return 跳过拉取 → 用户切回 ChatPage 看不见对话）。
@@ -262,8 +265,17 @@ export default function ChatPage() {
               const res = await getChatMessages(sessionId);
               const hist: ChatMsg[] = (res.messages || [])
                 .filter((m: any) => m.role === 'user' || m.role === 'assistant')
-                .map((m: any) => ({ role: m.role, content: m.content || '' }));
+                // 保留 choices：后端会把「已弹出但用户还没选」的清洗方案补在历史末尾，
+                // 之前只取 role/content 会把选项丢掉，刷新后只剩文本没有按钮可点。
+                .map((m: any) => ({
+                  role: m.role,
+                  content: m.content || '',
+                  choices: m.choices || [],
+                }));
               if (hist.length) {
+                // 发送进行中：绝不覆盖——否则会把 send 刚 replaceLast 写入的
+                // 带 choices 的即时响应（弹窗按钮）冲掉，导致"无按钮 + 空气泡"。
+                if (sendingRef.current) return;
                 // 仅当后端历史比当前缓存/内存更完整时才覆盖，
                 // 避免覆盖用户正在编辑中的新对话。
                 setMessages((prev) => (hist.length >= prev.length ? hist : prev));
@@ -314,13 +326,8 @@ export default function ChatPage() {
   // choiceId 非空：复用上一条助手消息的原文作为提问，回传用户选择
   const safeChoiceId = choiceId ? String(choiceId) : '';
   const text = safeChoiceId ? '' : input.trim();
-  // 上一轮请求还在跑：静默忽略会让用户困惑（文字卡在框里），给出轻量提示后返回
-  if (!safeChoiceId && sending) {
-    setMessages((m) => [...m, {
-      role: 'assistant',
-      content: '⏳ 上一轮分析还在进行中，请稍候再发消息。',
-      pending: false,
-    }]);
+  // 上一轮请求还在跑：用同步 ref 拦截（闭包 sending 有旧值风险），连点直接丢弃，不追加消息
+  if (!safeChoiceId && sendingRef.current) {
     return;
   }
   if (!safeChoiceId && !text) return;
@@ -335,6 +342,7 @@ export default function ChatPage() {
 
   if (!safeChoiceId) setInput('');
   setSending(true);
+  sendingRef.current = true;
 
     // 用户点选方案 → 先把该选择作为一条 user 消息展示
     if (safeChoiceId) {
@@ -374,6 +382,7 @@ export default function ChatPage() {
       replaceLast({ role: 'assistant', content: `⚠️ ${err}` });
     } finally {
       setSending(false);
+      sendingRef.current = false;
     }
   }, [input, sending, hasData, sessionId]);
 
@@ -543,9 +552,20 @@ export default function ChatPage() {
                 const hasAnchors = segs.length > 1;
                 if (!hasAnchors) {
                   // 无锚点：原行为 —— 全部 markdown 渲染完后追加图表列表
+                  // ★ 大屏场景：LLM 经常复述工具内部的图表与表格写成大段文字
+                  //   （违反 prompt 大屏铁律但不总听话），这里前端兜底——
+                  //   本轮工具结果含 build_dashboard 成功时，冗长文字换成一句简短提示，
+                  //   只保留 BigScreenCard 的图表视觉。失败时仍显示 LLM 的错误说明。
+                  const hasBigscreen = (m.toolResults || []).some(
+                    (tr: ToolResult) => tr.tool === 'build_dashboard' && tr.status === 'ok',
+                  );
                   return (
                     <>
-                      <div className="md-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(rawContent) }} />
+                      {hasBigscreen ? (
+                        <div className="text-sm text-slate-500">已为您生成数据大屏，请查看下方预览。</div>
+                      ) : (
+                        <div className="md-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(rawContent) }} />
+                      )}
                       {visualResults.length > 0 && (
                         <div className="mt-3">
                           {visualResults.map((tr, ti) => (
@@ -684,7 +704,19 @@ export default function ChatPage() {
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+            onKeyDown={(e) => {
+              // ★ 仅在非 IME 合成态响应 Enter 提交。
+              //   中文输入法下，Enter 会先触发 compositionend（确认上屏），紧接着
+              //   浏览器还会再发一次原生 keydown Enter。React 18 不会合并这两个事件，
+              //   导致 send 被调两次、产生两个 user 气泡。
+              //   isComposing 会在 IME 合成期间为 true（合成结束到原生 keydown 之间为 false，
+              //   但此时 input.value 已被上屏的"分析"覆盖、且 React 仍把第二次 keydown
+              //   视为 IME 流程的延续——所以统一用 keyCode 229 兜底）。
+              if (e.key !== 'Enter' || e.shiftKey) return;
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+              e.preventDefault();
+              send();
+            }}
             rows={2}
             placeholder={hasData ? '输入你的问题，回车发送…' : '请先上传数据后再提问'}
             className="flex-1 resize-none rounded-xl bg-white/60 border border-slate-300/60 px-4 py-3 text-sm text-slate-800 outline-none focus:border-violet-400/60"

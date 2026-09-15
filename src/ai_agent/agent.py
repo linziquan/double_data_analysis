@@ -471,21 +471,36 @@ class DataAnalysisAgent:
             # 若 LLM 在第一轮就自行带 method 调用（未经用户从弹窗选择），视为跳过体检态，
             # 忽略 method、强制退回体检态，让系统先把可选项弹给用户。
             is_choice_continuation = "我选择执行" in (user_message or "")
-            print(f"[DEBUG 门禁] method={method!r} type={type(method).__name__} | is_choice_continuation={is_choice_continuation} | user_message={user_message!r}")
             if method and not is_choice_continuation:
                 logger.warning("clean_data 门禁：LLM 未经用户选择就带 method=%s 调用，强制退回体检态", method)
                 method = None
-            print(f"[DEBUG 门禁] after method={method!r}")
 
             # 体检态（无 method）→ 直接对当前 df 扫描建议
             if not method:
                 from tools_registry import clean_data as _clean_data
                 cur = self._current_df(manager, session_id)
-                res = _clean_data(cur, None)
-                return {"tool": name, "status": "ok" if res.ok else "fail",
-                        "summary": res.message or "",
-                        "data": res.data if res.ok else {"error": res.error},
-                        "await_choice": True}
+                # 透传用户配置（llm_cfg）：清洗推荐的 LLM 调用必须跟随前端选的
+                # api_key/base_url/model，不能写死读 .env —— 否则前端换 key 后
+                # 清洗推荐仍因后端 .env 旧 key 失效而报"AI 不可用，已用离线兜底推荐"。
+                _llm_cfg = self._get_llm_cfg()
+                res = _clean_data(cur, None, llm_cfg=_llm_cfg)
+                needs = (res.data or {}).get("needs_cleaning", True)
+                if needs:
+                    # 有缺失值：维持原体检态，前端弹选项框让用户选填充方式
+                    return {"tool": name, "status": "ok" if res.ok else "fail",
+                            "summary": res.message or "",
+                            "data": res.data if res.ok else {"error": res.error},
+                            "await_choice": True}
+                # 无缺失值（方案 B）：直接跑一遍清洗（无缺失列仅做类型规整，无副作用），
+                # 不弹框，并显式标记 cleaned_at 使后续轮次跳出强制清洗分支。
+                res2 = _clean_data(cur, [{"method": "fill_mean"}], llm_cfg=_llm_cfg)
+                session.data_profile["cleaned_at"] = time.time()
+                # 数据无需清洗已通过：清除挂起的选择状态，避免后续轮次仍被强制弹框
+                session.data_profile.pop("pending_clean", None)
+                return {"tool": name, "status": "ok" if res2.ok else "fail",
+                        "summary": (res2.message or "数据无需清洗，已通过"),
+                        "data": res2.data if res2.ok else {"error": res2.error},
+                        "await_choice": False}
 
             # 执行态：单表直接取，多表先合并
             if len(valid) <= 1:
@@ -517,7 +532,7 @@ class DataAnalysisAgent:
             # 执行清洗
             from tools_registry import clean_data as _clean_data
             actions = [{"method": method}]
-            res = _clean_data(mapped_df, actions)
+            res = _clean_data(mapped_df, actions, llm_cfg=self._get_llm_cfg())
             if not res.ok:
                 return {"tool": name, "status": "fail", "summary": res.error or "清洗失败", "data": {}}
             cleaned_df = res.data.get("cleaned_df")
@@ -538,6 +553,12 @@ class DataAnalysisAgent:
             # messages 注入一条"请立即调用三分析工具"的 user 提示（并立即清标志防死循环），
             # 由 LLM 自动调用 run_template / run_analysis / run_python，
             # 三个工具把完整 AnalysisPackage 写入 session.analysis_packages，供产出工具消费。
+
+            # 显式标记清洗完成（方案 B 关键：让下一轮 _is_dataset_cleaned 兜底命中，
+            # 跳出强制 clean_data 分支，避免死锁并放开后续图表/报告工具）。
+            session.data_profile["cleaned_at"] = time.time()
+            # 用户已做出选择并完成清洗：清除挂起的选择状态
+            session.data_profile.pop("pending_clean", None)
 
             return {
                 "tool": name, "status": "ok",
@@ -764,7 +785,9 @@ class DataAnalysisAgent:
             # 改法1：清洗完成后下一轮顶部注入提示，逼 LLM 自动调三分析工具。
             # 注入后立即清标志——即便本轮 LLM 未发 tool_calls 直接返回，下下轮也绝不再注入，彻底无死循环。
             if _need_inject_clean_prompt:
-                messages.append({"role": "user", "content": _CLEAN_DONE_PROMPT})
+                # _system_injected 标记：该消息是系统注入（非用户输入），/chat/messages
+                # 返回历史时会过滤掉，避免前端把它渲染成用户气泡。
+                messages.append({"role": "user", "content": _CLEAN_DONE_PROMPT, "_system_injected": True})
                 _need_inject_clean_prompt = False
                 print(f"[agentic_chat] round={_round} injected clean-done prompt -> auto-run 3 analysis tools")
             _continue_count = 0
@@ -773,7 +796,12 @@ class DataAnalysisAgent:
             try:
                 create_kwargs: Dict[str, Any] = {
                     "model": self.model,
-                    "messages": messages,
+                    # 浅拷贝剥离内部标记字段（_system_injected/_preamble）：
+                    # 部分 OpenAI 兼容网关对未知字段严格校验，带下划线键可能被拒收。
+                    "messages": [
+                        {k: v for k, v in m.items() if not k.startswith("_")}
+                        for m in messages
+                    ],
                     "temperature": 0.3,
                     "timeout": 120,
                 }
@@ -801,44 +829,21 @@ class DataAnalysisAgent:
                         #   - 有缺失值 → 只放 clean_data，由 LLM 调体检态弹框供用户点选；
                         #   - 无缺失值 → 直接跳过清洗，放开三分析工具。
                         # 无论哪种，未清洗轮绝不放出图/大屏/报告工具。
-                    if not is_cleaned:
-                        _dp = getattr(manager.get_session(session_id), "data_profile", None) or {}
-                        _overview = _dp.get("missing_overview") or {}
-                        _total_missing = _overview.get("total_missing", 0) or 0
-                        if _total_missing > 0:
-                            tools_for_round = [t for t in function_defs if _names_eq(t, "clean_data")]
-                        else:
-                            # 无缺失：跳过清洗，直接进入三分析阶段
-                            tools_for_round = [t for t in function_defs
-                                               if _names_eq(t, "run_template")
-                                               or _names_eq(t, "run_analysis")
-                                               or _names_eq(t, "run_python")]
-                            # ★ 大屏意图特批：单表场景下 is_cleaned 永远 False（无 is_merged 宽表、
-                            # 也无 cleaned 标记），若只在"已跑过三分析"时才补 build_dashboard，
-                            # 则「首轮直接说要大屏」会因 messages 从未跑过三分析而永远拿不到
-                            # build_dashboard 工具 → 大屏彻底不触发（历史"依然没有大屏"根因）。
-                            # 因此改为与已清洗分支一致：无论是否已跑分析，都发放四件套 +
-                            # pipeline 提示，让 LLM 首轮即可「先分析 → 后大屏」闭环。
-                            if _has_bigscreen_intent(message):
-                                tools_for_round = list(tools_for_round) + [
-                                    t for t in function_defs if _names_eq(t, "build_dashboard")
-                                ]
-                                # 注入大屏四件套调用顺序提示（复用已清洗分支的常量）。
-                                _BIGSCREEN_PIPELINE_PROMPT = (
-                                    "用户要求生成大屏。请按以下顺序串行调用：\n"
-                                    "  1) run_template（业务模型分析）\n"
-                                    "  2) run_analysis（通用统计分析）\n"
-                                    "  3) run_python（自由写码分析）\n"
-                                    "  4) build_dashboard（生成大屏，依赖前 3 步的分析包）\n"
-                                    "不要用文字伪造大屏。最终视觉产物（KPI/图表网格/表格）必须由 "
-                                    "build_dashboard 工具调用产生。文字气泡里最多一句过渡话。"
-                                )
-                                if not any(
-                                    m.get("role") == "user"
-                                    and _BIGSCREEN_PIPELINE_PROMPT in (m.get("content") or "")
-                                    for m in messages
-                                ):
-                                    messages.append({"role": "user", "content": _BIGSCREEN_PIPELINE_PROMPT})
+                    # force_clean：未清洗+分析意图时，在 API 层硬约束 LLM 只能调 clean_data，
+                    # 彻底杜绝 tool_choice=auto 下 LLM 越级调三分析工具导致空转超时（方案 A）。
+                    force_clean = False
+                    # 挂起态：上一轮已弹出清洗选择框但用户尚未选择（刷新/追问都会命中这里）。
+                    # 此时无论用户说什么（哪怕只是「推荐呢 / 选择框呢」这类不含分析词的追问），
+                    # 都必须重新走体检态把选项再弹一次——否则不放任何工具给 LLM，
+                    # 它只能把 <tool_call> 当纯文本写给用户在嘴上"承诺弹框"。
+                    _pending_clean = self._get_pending_clean(manager, session_id)
+                    if not is_cleaned and (_has_analysis_intent(message)
+                                           or _has_clean_intent(message)
+                                           or _pending_clean is not None):
+                        # 未清洗 + 用户有分析/清洗意图 → 仅下放 clean_data 并强制 tool_choice=clean_data。
+                        # LLM 在 API 层被硬约束只能调 clean_data 体检态：有缺失→弹选项框；无缺失→执行态自动通过。
+                        tools_for_round = [t for t in function_defs if _names_eq(t, "clean_data")]
+                        force_clean = True
                     elif is_cleaned:
                         # 防御性放开：只要上下文里已存在「清洗完成→请调三分析」注入提示
                         # （该提示永久留在 messages 中，不像 _need_inject_clean_prompt 局部标志那样被清），
@@ -852,15 +857,41 @@ class DataAnalysisAgent:
                         # 顺序很重要：明确的用户意图（分析/图表/报告/大屏）必须先于兜底判定，
                         # 否则「刚清洗完」的 _clean_prompt_in_ctx 永久为 True 会把所有后续消息都吞成三分析，
                         # 导致生成大屏/报告/出图永远收不到工具（表现为点了没反应）。
-                        if _has_analysis_intent(message):
+                        if _has_report_intent(message):
+                            # 报告意图（已清洗）：必须放在 analysis 分支之前——因为
+                            # 「生成分析报告」同时含「分析」关键词，若 analysis 先命中，
+                            # generate_report 永不暴露，LLM 只会跑分析然后写纯文字
+                            # （用户实测 bug：要报告却只出文字）。
+                            # 与「大屏」同构：给 [三分析 + generate_report] 四件套并注入
+                            # 顺序提示，保证 packages 先产出、报告后生成。
+                            tools_for_round = [t for t in function_defs
+                                               if _names_eq(t, "run_template")
+                                               or _names_eq(t, "run_analysis")
+                                               or _names_eq(t, "run_python")
+                                               or _names_eq(t, "generate_report")]
+                            _REPORT_PIPELINE_PROMPT = (
+                                "用户要求生成分析报告。请按以下顺序串行调用：\n"
+                                "  1) run_template（业务模型分析）\n"
+                                "  2) run_analysis（通用统计分析）\n"
+                                "  3) run_python（自由写码分析）\n"
+                                "  4) generate_report（生成报告，依赖前 3 步写入的分析包）\n"
+                                "不要用文字伪造报告。最终报告必须由 generate_report 工具调用产生，"
+                                "文字只作一句过渡。"
+                            )
+                            # 避免重复注入：仅在历史里还没有该提示时插入
+                            if not any(
+                                m.get("role") == "user"
+                                and _REPORT_PIPELINE_PROMPT in (m.get("content") or "")
+                                for m in messages
+                            ):
+                                messages.append({"role": "user", "content": _REPORT_PIPELINE_PROMPT, "_system_injected": True})
+                        elif _has_analysis_intent(message):
                             tools_for_round = [t for t in function_defs
                                                if _names_eq(t, "run_template")
                                                or _names_eq(t, "run_analysis")
                                                or _names_eq(t, "run_python")]
                         elif _has_chart_intent(message):
                             tools_for_round = [t for t in function_defs if _names_eq(t, "generate_chart")]
-                        elif _has_report_intent(message):
-                            tools_for_round = [t for t in function_defs if _names_eq(t, "generate_report")]
                         elif _has_bigscreen_intent(message):
                             # 大屏意图（已清洗）：让 LLM 一次性拥有 [三分析 + build_dashboard] 四件套，
                             # 用 system 提示强制 LLM 按"先分析 → 后大屏"顺序调用。
@@ -889,7 +920,7 @@ class DataAnalysisAgent:
                                 and _BIGSCREEN_PIPELINE_PROMPT in (m.get("content") or "")
                                 for m in messages
                             ):
-                                messages.append({"role": "user", "content": _BIGSCREEN_PIPELINE_PROMPT})
+                                messages.append({"role": "user", "content": _BIGSCREEN_PIPELINE_PROMPT, "_system_injected": True})
                         elif _clean_prompt_in_ctx:
                             # 兜底：刚清洗完且用户本轮没说任何明确意图词 → 放开三分析（驱动自动补跑）。
                             # 仅作最后兜底，不抢占上面的明确意图。
@@ -901,6 +932,7 @@ class DataAnalysisAgent:
                             tools_for_round = []
                     else:
                         tools_for_round = []
+                    _tool_names = [t.get("function", {}).get("name") for t in (tools_for_round or [])]
                     # 没有任何工具可下放时，强制 LLM 直接文字回答（不允许它自己发明工具调用）
                     if not tools_for_round:
                         create_kwargs.pop("tools", None)
@@ -910,7 +942,12 @@ class DataAnalysisAgent:
                         # 大屏分支保持 auto：4 件套让 LLM 自由按顺序串行调用，system 提示
                         # 已经明示顺序。如果 LLM 在跑完三分析后还想用纯文字总结"补刀"，
                         # 下面的 _bigscreen_post_dash_guard 会程序兜底：强制它再调一次 build_dashboard。
-                        create_kwargs["tool_choice"] = "auto"
+                        # force_clean 时：API 层硬约束 LLM 只能调 clean_data，杜绝越级空转；
+                        # 其余分支保持 auto：让 LLM 按意图自由调用对应工具。
+                        create_kwargs["tool_choice"] = (
+                            {"type": "function", "function": {"name": "clean_data"}}
+                            if force_clean else "auto"
+                        )
                 # ★ 手动重试：针对 ConnectionError / APIConnectionError / Timeout / OSError
                 # 这类上游或本地 socket 瞬时错误，最多 3 次退避重试。
                 # - apihub.agnes-ai.com 偶尔 ConnectError（境外网络抖动）
@@ -971,7 +1008,62 @@ class DataAnalysisAgent:
                         "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     } for tc in msg.tool_calls
                 ]
+                # _preamble 标记：LLM 调工具前顺带说了一句开场白（如 "I'll run the
+                # three analysis tools now."）。这类话会被后续轮次的最终总结覆盖，
+                # 属于聊天流噪音，/chat/messages 返回历史时过滤掉。
+                if (msg.content or "").strip():
+                    assistant_msg["_preamble"] = True
             messages.append(assistant_msg)
+
+            # —— 清洗前置硬拦截（CLEAN GUARD）——
+            # 仅未清洗+分析意图轮（force_clean）。Agnes 网关静默忽略 tool_choice 强制格式，
+            # LLM 仍会越级调三分析/产出工具导致空转，故后端进程内硬拦截：丢弃越级 tool_calls，
+            # 强制注入 clean_data 体检态（内部实时扫 df 算缺失，不依赖 data_profile.missing_overview）。
+            # 体检态有缺失 → await_choice=True → 必须 return 给前端弹框（不能 continue，否则死循环永不弹框）。
+            if force_clean:
+                # force_clean 下 Agnes 网关会静默忽略 tool_choice=clean_data 强制格式，
+                # LLM 可能直接回文本（不调工具）或越级调三分析。两种情况都必须兜底：
+                # 只要 LLM 没有正确调 clean_data，就强制注入 clean_data 体检态。
+                _names = [tc.function.name for tc in (msg.tool_calls or [])]
+                if not msg.tool_calls or any(n != "clean_data" for n in _names):
+                    print(f"[agentic_chat] round={_round} CLEAN GUARD: 丢弃越级 tool_calls={_names}，强制 clean_data 体检态")
+                    _forced = self._resolve_tool_call("clean_data", {}, manager, session_id, user_message=message)
+                    import uuid as _uuid
+                    _fake_tc_id = "call_guard_" + _uuid.uuid4().hex[:12]
+                    messages.append({
+                        "role": "assistant", "content": "",
+                        "tool_calls": [{"id": _fake_tc_id, "type": "function",
+                                        "function": {"name": "clean_data", "arguments": "{}"}}],
+                    })
+                    messages.append({
+                        "role": "tool", "tool_call_id": _fake_tc_id,
+                        "content": json.dumps({
+                            "ok": _forced.get("status") == "ok",
+                            "summary": _forced.get("summary") or "",
+                            "data": _forced.get("data", {}),
+                        }, ensure_ascii=False),
+                    })
+                    tool_results.append({
+                        "tool": _forced.get("tool"), "status": _forced.get("status"),
+                        "summary": _forced.get("summary"),
+                        "await_choice": _forced.get("await_choice", False),
+                        "data": _forced.get("data", {}),
+                    })
+                    if _forced.get("await_choice"):
+                        # 有缺失：暂停等用户选，必须 return 给前端弹框（不能 continue）
+                        content = self._strip_tool_tags(_forced.get("summary") or "请选择缺失值填充方式：")
+                        _choices = self._extract_choices(tool_results)
+                        self._persist_pending_clean(manager, session_id, content, _choices)
+                        return {
+                            "kind": self._classify_response(content, tool_results),
+                            "content": content,
+                            "choices": _choices,
+                            "tool_results": tool_results,
+                            "data_preview": self._build_data_preview(tool_results),
+                            "messages": messages,
+                        }
+                    # 无缺失自动过：cleaned_at 已写，continue 进下一轮放开三分析
+                    continue
 
             # 没有工具调用 → 可能是「完整最终回答」或「已执行工具但未总结完整」
             if not msg.tool_calls:
@@ -982,8 +1074,15 @@ class DataAnalysisAgent:
                 # 物理根除"用文字伪造大屏"。
                 if _has_bigscreen_intent(message):
                     # 取消 is_cleaned 限制：单表场景下 is_cleaned 永远为 False（没有 is_merged 宽表），
-                    # 大屏兜底必须不依赖它。改用"LLM 已跑过至少 1 个三分析工具"作为包非空的判断。
-                    _already_ran_analysis = any(
+                    # 大屏兜底必须不依赖它。改用"LLM 已跑过至少 1 个三分析工具"或"会话里已有持久化分析包"
+                    # 作为包非空的判断。必须同时检查 session.analysis_packages：chat.py 的 _sanitize_history
+                    # 会把历史 tool_calls 洗掉，导致只看 messages 时误判为"还没分析过"。
+                    try:
+                        _session = manager.get_session(session_id)
+                        _has_packages = bool(getattr(_session, "analysis_packages", None))
+                    except Exception:
+                        _has_packages = False
+                    _already_ran_analysis = _has_packages or any(
                         tc.get("function", {}).get("name") in {"run_template", "run_analysis", "run_python"}
                         for prior in messages
                         for tc in (prior.get("tool_calls") or [])
@@ -1043,6 +1142,10 @@ class DataAnalysisAgent:
                     and _continue_count < _MAX_CONTINUE
                     and bool(ok_results)
                     and content.strip()
+                    # 终态产物（报告/大屏）已成功生成时，产物本身就是答复——
+                    # 不再逼 LLM 补写「覆盖每个工具结论」的大段基础总结（用户实测：
+                    # 出完报告后又刷一大段含数据清洗等的总结，喧宾夺主）。
+                    and not _bigscreen_done
                     and not self._is_complete_summary(content, ok_results)
                 )
                 if _needs_continue:
@@ -1056,8 +1159,22 @@ class DataAnalysisAgent:
                             "必须覆盖每一个已执行工具的分析结论（不要只写建议、不要中断）。"
                             "不要再次调用任何工具，直接输出文字结论即可。"
                         ),
+                        "_system_injected": True,
                     })
                     continue  # 进入下一轮：_in_continue_phase=True → 不放工具 → LLM 纯文字总结
+
+                # 关键前置：若本轮有清洗体检态在等用户选择（await_choice=True），
+                # 必须直接返回 choice 弹框，绝不走下方 _force_summary_from_results——
+                # 否则 await_choice 结果会被当成「已完成」去强制总结，陷入反复调 clean_data 的死循环。
+                if any(tr.get("await_choice") for tr in tool_results):
+                    return {
+                        "kind": "choice",
+                        "content": self._strip_tool_tags(content or "请选择缺失值填充方式："),
+                        "choices": self._extract_choices(tool_results),
+                        "tool_results": tool_results,
+                        "data_preview": self._build_data_preview(tool_results),
+                        "messages": messages,
+                    }
 
                 # 规范兜底：若 LLM 未写文字总结，但确实跑出了 ok 结果，
                 # 补一轮请求强制 LLM 基于全部结果写完整总结（不污染 messages 历史）
@@ -1114,8 +1231,8 @@ class DataAnalysisAgent:
                                 "role": "tool",
                                 "tool_call_id": tc.id,
                                 "content": "该操作被门禁拦截：数据尚未清洗且有缺失值。请先调用 clean_data 完成清洗流程。",
-                        })
-                        continue
+                            })
+                            continue
                 try:
                     fn_args = json.loads(tc.function.arguments or "{}")
                 except Exception:
@@ -1163,10 +1280,12 @@ class DataAnalysisAgent:
                     content = self._strip_tool_tags(
                         result.get("summary") or "已扫描数据，请选择缺失值填充方式："
                     )
+                    _choices = self._extract_choices(tool_results)
+                    self._persist_pending_clean(manager, session_id, content, _choices)
                     return {
                         "kind": "choice",
                         "content": content,
-                        "choices": self._extract_choices(tool_results),
+                        "choices": _choices,
                         "tool_results": tool_results,
                         "data_preview": None,
                         "messages": messages,
@@ -1281,7 +1400,11 @@ class DataAnalysisAgent:
             })
             resp = self.client.chat.completions.create(
                 model=self.model,
-                messages=summary_msgs,
+                # 剥离内部标记字段（_system_injected/_preamble），与主循环 create_kwargs 同规则
+                messages=[
+                    {k: v for k, v in m.items() if not k.startswith("_")}
+                    for m in summary_msgs
+                ],
                 temperature=0.3,
                 timeout=120,
                 tool_choice="none",
@@ -1456,6 +1579,37 @@ class DataAnalysisAgent:
         return out[:6]
 
     @staticmethod
+    def _persist_pending_clean(manager, session_id: str, content: str, choices: list) -> None:
+        """持久化「清洗方案待用户选择」的挂起状态到 session.data_profile。
+
+        kind=choice 的 choices 原本只存在于当次 HTTP 响应中，刷新页面/切走再回即丢失，
+        用户会看到「发现 N 列缺失值」却没有任何按钮可点。这里把摘要与选项写进
+        session，供 /chat/messages 复原弹框、force_clean 判定重新触发体检态。
+        """
+        try:
+            session = manager.get_session(session_id)
+            if session is None:
+                return
+            session.data_profile["pending_clean"] = {
+                "summary": content,
+                "choices": choices,
+                "ts": time.time(),
+            }
+        except Exception as e:
+            print(f"[agentic_chat] persist pending_clean failed: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _get_pending_clean(manager, session_id: str):
+        """读取挂起的清洗选择状态，无则 None。"""
+        try:
+            session = manager.get_session(session_id)
+            if session is None:
+                return None
+            return (session.data_profile or {}).get("pending_clean")
+        except Exception:
+            return None
+
+    @staticmethod
     def _strip_tool_tags(content: str) -> str:
         """兜底清洗：剥离 LLM 可能写进回复的工具调用/结果标签及其内部内容。
 
@@ -1467,8 +1621,13 @@ class DataAnalysisAgent:
             return content
         import re
         known = r"(?:profile_data|clean_data|run_template|run_python)"
+        # 兼容两种写法：
+        #   A) <tool_call>clean_data...</tool_call>（工具名紧跟开标签）
+        #   B) <tool_call><function=clean_data></function></tool_call>（嵌套 function 标签，
+        #      LLM 在没拿到工具时会把调用意图写成这种文本，旧正则匹配不到会直接甩给用户）
+        # 采用「开标签 → 中间出现已知工具名 → 闭标签」的宽松匹配，两种都能清掉。
         pattern = re.compile(
-            r"<tool_call>\s*(" + known + r")\b.*?</tool_call>"
+            r"<tool_call>(?:(?!</tool_call>).)*?" + known + r"(?:(?!</tool_call>).)*?</tool_call>"
             r"|<tool_result>.*?</tool_result>",
             re.DOTALL | re.IGNORECASE,
         )
@@ -1502,7 +1661,6 @@ class DataAnalysisAgent:
             if tr.get("tool") == "clean_data" and tr.get("status") == "ok":
                 data = tr.get("data") or {}
                 alts = data.get("available_alternatives") or data.get("recommendation", {}).get("alternatives")
-                print(f"[DEBUG _extract_choices] raw alts={alts!r}")
                 if alts:
                     result = [
                         {"id": a["method"], "label": a.get("label"),
@@ -1510,9 +1668,7 @@ class DataAnalysisAgent:
                         for a in alts
                         if isinstance(a.get("method"), str) and a.get("method")
                     ]
-                    print(f"[DEBUG _extract_choices] produced ids={[r['id'] for r in result]} types={[type(r['id']).__name__ for r in result]}")
                     return result
-        print(f"[DEBUG _extract_choices] no clean_data ok result -> return []")
         return []
 
     def _build_data_preview(self, tool_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1671,6 +1827,11 @@ class DataAnalysisAgent:
                 "packages_used": len(packages),
             }
 
+        # 报告绑图前置：对缺 option 的 chart_data 用 ChartRenderer 现场渲染出
+        # ECharts option（孤儿模块接线）。成功/降级两条路径共用同一份 sections_data，
+        # 此处渲染一次即可；操作 build_input 新构造的 dict，不污染 session 原始数据。
+        _render_missing_chart_options(report_input["sections_data"])
+
         user_prompt = REPORT_BI_USER_PROMPT_TEMPLATE.format(
             packages_summary=report_input["packages_summary"],
             prompt_text=report_input["prompt_text"],
@@ -1735,6 +1896,9 @@ class DataAnalysisAgent:
             try:
                 fallback_sections = _build_fallback_from_packages(packages, report_input)
                 fallback_sections = _enforce_high_severity_coverage(fallback_sections, report_input["sections_data"])
+                # 降级路径补绑图表：_build_fallback_from_packages 已构造好 chart_titles，
+                # 此前缺此步导致降级报告纯文字无图；render 已在分支前统一完成，此处可直接绑定。
+                fallback_sections = _bind_package_charts_to_sections(fallback_sections, report_input["sections_data"])
                 # 归一化 type 名 → 前端兼容格式
                 fallback_sections = _normalize_section_types(fallback_sections)
                 return {
@@ -3093,6 +3257,10 @@ def _bind_package_charts_to_sections(
     新结构（V4）：每个 section 用 `chart_titles`（字符串数组）声明其正文中引用的图表，
     此处把它们对应的完整图表（含 option/raw_data）提取成 `section_charts` 挂回 section，
     供前端就近插图。不再依赖旧的 insights[].chart_title 结构。
+
+    绑定策略：只绑定 LLM 在 chart_titles 中明确声明、且能匹配到源图的图（保证「相关」）。
+    高危发现关联的图由 _enforce_high_severity_coverage 预先补进 chart_titles。
+    ★ 不做「按类型把所有图塞给章节」的兜底——用户明确要求只放被用到的相关图。
     """
     # 全局 title -> 完整图表对象 映射（图表可能来自跨包，故全局解析）
     chart_map: Dict[str, Dict[str, Any]] = {}
@@ -3147,6 +3315,74 @@ def _bind_package_charts_to_sections(
         section["section_charts"] = bound
 
     return sections
+
+
+def _render_missing_chart_options(sections_data: Dict[str, List[Dict[str, Any]]]) -> None:
+    """对 sections_data 内 option 为空但 data 非空的 chart_data 条目，构造 ChartData
+    对象调 ChartRenderer().render() 现场渲染出 ECharts option，并原地回填到 dict。
+
+    - sections_data 由 ReportBuilder.build_input 新构造（非 session.analysis_packages 原始数据），
+      原地回填无跨请求副作用。
+    - 已有 option 的图（如漏斗模型手工构造的）直接跳过（幂等）。
+    - 渲染失败（ChartRenderer 返回 None / 异常）保持 option 为空，后续
+      _bind_package_charts_to_sections 会自然跳过该图，绝不阻塞报告生成。
+    - 渲染层导入失败（极端情况，如依赖缺失）整体降级为纯文字报告，不抛出。
+    """
+    try:
+        from src.analysis_templates.base import ChartData
+        from src.chart_renderer import ChartRenderer
+    except Exception as exc:
+        logger.warning("[report] 图表渲染模块导入失败，降级为纯文字报告：%s: %s",
+                       type(exc).__name__, exc)
+        return
+
+    renderer = ChartRenderer()
+    rendered = 0
+    skipped = 0
+    # 正确结构：sections_data[章节名] = [分析包 dict, ...]，图在 pkg["chart_data"] 里。
+    # （此前误把「分析包列表」当成「图表列表」，cd 实际是包 dict、cd.get("data") 恒空，
+    #  导致一张图都没渲染、option 从未回填——这正是「报告只有纯文字」的直接原因之一。）
+    for chart_list in (
+        (pkg.get("chart_data", []) if isinstance(pkg, dict) else [])
+        for pkgs in sections_data.values()
+        for pkg in pkgs
+    ):
+        for cd in chart_list:
+            if not isinstance(cd, dict):
+                continue
+            if cd.get("option"):
+                continue
+            data = cd.get("data") if isinstance(cd.get("data"), list) else []
+            if not data:
+                skipped += 1
+                continue
+            try:
+                chart_type = cd.get("chart_type") or cd.get("type") or ""
+                cd_obj = ChartData(
+                    slot=str(cd.get("slot", "")),
+                    chart_type=str(chart_type),
+                    title=str(cd.get("title", "")),
+                    x=str(cd.get("x", "")),
+                    y=str(cd.get("y", "")),
+                    data=data,
+                    color=str(cd.get("color", "")),
+                    right_col=str(cd.get("right_col", "")),
+                    chart_config=cd.get("chart_config") if isinstance(cd.get("chart_config"), dict) else {},
+                )
+                item = renderer.render(cd_obj)
+                if item is not None and item.option:
+                    cd["option"] = item.option
+                    rendered += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                skipped += 1
+                logger.warning(
+                    "报告图表渲染跳过 chart_type=%s title=%s: %s: %s",
+                    cd.get("chart_type", ""), cd.get("title", ""),
+                    type(exc).__name__, exc,
+                )
+    logger.info("[report] 图表 option 渲染完成：已渲染 %d 张 / 跳过 %d 张", rendered, skipped)
 
 
 def _build_fallback_from_packages(

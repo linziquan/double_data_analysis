@@ -1,6 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { FileText, Trash2, AlertTriangle, Database, GitMerge, ArrowRight } from 'lucide-react';
+import { FileText, Trash2, AlertTriangle, Database, GitMerge } from 'lucide-react';
 import MetricCard from '../components/MetricCard';
 import DataTable from '../components/DataTable';
 import { useData } from '../contexts/DataContext';
@@ -15,7 +14,6 @@ const ACCEPT = '.csv, .xlsx, .xls, .json, .sqlite, .db';
 
 export default function UploadPage() {
   const { state, dispatch, ensureValidSession } = useData();
-  const navigate = useNavigate();
   const { sessionId, datasets, activeDatasetId, usedBytes, quotaBytes, datasetCount, datasetLimit, fileName, rows, columns, preview, columnInfo } = state;
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -314,12 +312,6 @@ export default function UploadPage() {
         <div className="mt-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold text-slate-900">数据概览</h2>
-            <button
-              onClick={() => navigate('/analysis')}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-white bg-violet-600 hover:bg-violet-700 transition-colors"
-            >
-              进入分析 <ArrowRight className="w-4 h-4" />
-            </button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
             <MetricCard label="当前报表" value={fileName} hint="文件名" className="glass-card-soft" />

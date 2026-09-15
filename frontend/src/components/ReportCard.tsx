@@ -45,6 +45,10 @@ const SECTION_ICON: Record<string, string> = {
   next_steps: '下一步',
 };
 
+// 报告内图表统一高度：容器与图表组件必须一致，否则组件默认 360px 会溢出固定高度的
+// 容器、盖到下方文字上（用户实测「图表压在文字上面」）。
+const REPORT_CHART_HEIGHT = 320;
+
 const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
   const sections = report.sections || [];
   const [openSet, setOpenSet] = useState<Set<number>>(
@@ -60,11 +64,11 @@ const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
     });
 
   return (
-    <div className="mt-2 rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-[0_8px_30px_rgba(139,92,246,0.18)] overflow-hidden">
+    <div className="mt-2 rounded-2xl border border-slate-200/80 bg-white/80 backdrop-blur-md shadow-[0_8px_30px_rgba(56,189,248,0.12)] overflow-hidden">
       {/* 标题栏 */}
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10 bg-gradient-to-r from-violet-500/10 to-sky-400/5">
-        <FileText className="w-4 h-4 text-violet-300" />
-        <span className="text-sm font-semibold text-slate-100">
+      <div className="flex items-center gap-2 px-4 py-3 border-b border-slate-200/60 bg-gradient-to-r from-sky-50 to-violet-50">
+        <FileText className="w-4 h-4 text-violet-500" />
+        <span className="text-sm font-semibold text-slate-800">
           {report.report_title || '数据分析报告'}
         </span>
         <span className="ml-auto text-[11px] text-slate-400">
@@ -74,14 +78,14 @@ const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
 
       {/* 降级/警告提示 */}
       {report.warning && (
-        <div className="flex items-start gap-2 px-4 py-2 text-[12px] text-amber-300 bg-amber-500/10 border-b border-amber-400/20">
+        <div className="flex items-start gap-2 px-4 py-2 text-[12px] text-amber-700 bg-amber-50/80 border-b border-amber-200/60">
           <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
           <span>{report.warning}</span>
         </div>
       )}
 
       {/* 章节列表 */}
-      <div className="divide-y divide-white/5">
+      <div className="divide-y divide-slate-200/60">
         {sections.map((sec, i) => {
           const open = openSet.has(i);
           const charts = sec.section_charts || [];
@@ -92,10 +96,10 @@ const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
                 onClick={() => toggle(i)}
                 className="w-full flex items-center gap-2 text-left cursor-pointer"
               >
-                <span className="text-[13px] font-medium text-slate-200">
+                <span className="text-[13px] font-medium text-slate-800">
                   {sec.title || SECTION_ICON[sec.type || ''] || `章节 ${i + 1}`}
                 </span>
-                <span className="ml-auto text-[11px] text-slate-500">
+                <span className="ml-auto text-[11px] text-slate-400 hover:text-slate-600">
                   {open ? '收起' : '展开'}
                 </span>
               </button>
@@ -104,8 +108,8 @@ const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
                 <div className="mt-2">
                   {sec.content && (
                     <div
-                      className="text-[13px] leading-relaxed text-slate-300 prose prose-invert max-w-none
-                                 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_strong]:text-slate-100
+                      className="text-[13px] leading-relaxed text-slate-700 prose max-w-none
+                                 [&_h1]:text-base [&_h2]:text-sm [&_h3]:text-sm [&_strong]:text-slate-900
                                  [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5"
                       dangerouslySetInnerHTML={{ __html: renderMarkdown(sec.content) }}
                     />
@@ -114,8 +118,8 @@ const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
                   {sec.insights && sec.insights.length > 0 && (
                     <ul className="mt-2 space-y-1">
                       {sec.insights.map((ins, j) => (
-                        <li key={j} className="flex items-start gap-1.5 text-[12px] text-slate-400">
-                          <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-emerald-400/70 shrink-0" />
+                        <li key={j} className="flex items-start gap-1.5 text-[12px] text-slate-600">
+                          <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-emerald-500/80 shrink-0" />
                           <span>{ins}</span>
                         </li>
                       ))}
@@ -127,20 +131,22 @@ const ReportCard: React.FC<{ report: ReportData }> = ({ report }) => {
                       {charts.map((c, j) => (
                         <div
                           key={c.slot || j}
-                          className="rounded-xl border border-white/10 bg-slate-950/40 p-2"
+                          className="p-2"
                         >
                           {c.title && (
-                            <div className="text-[12px] text-slate-300 mb-1 px-1">{c.title}</div>
+                            <div className="text-[12px] text-slate-600 mb-1 px-1">{c.title}</div>
                           )}
-                          <div className="h-[280px]">
+                          <div style={{ height: REPORT_CHART_HEIGHT }}>
                             {c.option ? (
                               <EtherealChart
+                                slot={c.slot || c.chart_type || ''}
                                 chartType={c.chart_type || 'auto'}
                                 chartNode={c.option as Record<string, unknown>}
                                 title={c.title}
+                                height={REPORT_CHART_HEIGHT}
                               />
                             ) : (
-                              <div className="flex items-center justify-center h-full text-[12px] text-slate-600">
+                              <div className="flex items-center justify-center h-full text-[12px] text-slate-400">
                                 该图表暂无可渲染数据
                               </div>
                             )}

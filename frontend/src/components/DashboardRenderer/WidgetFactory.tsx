@@ -23,6 +23,8 @@ export interface WidgetRendererProps {
   onDrillDown?: (widgetId: string, dimension: string, nextLevel: string) => void;
   /** 错误回调 */
   onWidgetError?: (error: WidgetError) => void;
+  /** 尺寸缩放系数（全屏大屏模式传 >1 的值放大图表），默认 1 */
+  sizeScale?: number;
 }
 
 /**
@@ -43,12 +45,12 @@ const WIDGET_MAP: Record<string, React.ComponentType<WidgetRendererProps>> = {
   summary: InsightWidget,
 };
 
-export const WidgetFactory: React.FC<WidgetRendererProps> = memo(({ widget, onWidgetError, ...rest }) => {
+export const WidgetFactory: React.FC<WidgetRendererProps> = memo(({ widget, onWidgetError, sizeScale, ...rest }) => {
   const Component = WIDGET_MAP[widget.widget_type] || InsightWidget;
 
   return (
     <WidgetErrorBoundary widgetId={widget.widget_id} onError={onWidgetError}>
-      <Component widget={widget} {...rest} />
+      <Component widget={widget} sizeScale={sizeScale} {...rest} />
     </WidgetErrorBoundary>
   );
 });
