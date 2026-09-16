@@ -12,7 +12,9 @@ if (!API_BASE.endsWith('/api')) API_BASE += '/api';
 
 export const authApi = axios.create({
   baseURL: API_BASE,
-  timeout: 20000,
+  // 60s：Render 免费实例休眠后冷启动常需 30~50s，
+  // 原 20s 会在后端还没醒过来时就先超时（表现为 timeout of 20000ms exceeded）
+  timeout: 60000,
 });
 
 // 请求拦截：注入 Authorization
@@ -57,6 +59,18 @@ export const tryRefresh = async (): Promise<string | null> => {
 authApi.interceptors.response.use(
   (res) => res,
   async (err) => {
+    // 冷启动容错：后端休眠中时请求会超时/网络错误（无 response），
+    // 等待 5 秒让实例唤醒后重试一次，避免用户第一次注册直接失败。
+    const isNetworkError = !err.response &&
+      (err.code === 'ECONNABORTED' || err.code === 'ERR_NETWORK' ||
+       err.message?.includes('timeout') || err.message?.includes('Network Error'));
+    if (isNetworkError && err.config && !err.config._retried) {
+      err.config._retried = true;
+      console.warn('🔧 认证请求无响应（后端可能冷启动中），5 秒后重试…');
+      await new Promise((r) => setTimeout(r, 5000));
+      return authApi(err.config);
+    }
+
     const status = err.response?.status;
     const url = err.config?.url || '';
     const isAuthCall = url.includes('/auth/');
