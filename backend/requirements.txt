@@ -17,3 +17,5 @@ openpyxl==3.1.5
 PyJWT==2.10.1
 passlib==1.7.4
 bcrypt==4.0.1
+# 云端 SQLite 驱动（仅在配置了 SQLITECLOUD_URL 时使用，未配置时不会 import）
+sqlitecloud==0.0.84

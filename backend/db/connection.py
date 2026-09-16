@@ -20,6 +20,13 @@ _default_db_path = os.path.join(_project_root, "data", "app.db")
 # 从 .env 读取；若未设置则用默认 data/app.db（data/ 目录已加入 .gitignore，防大文件进仓库）
 DB_PATH = os.environ.get("DB_PATH", _default_db_path)
 
+# ===== 云端 SQLite（SQLite Cloud）=====
+# Render 免费实例的磁盘是临时的：重新部署或实例休眠后 app.db 会被重置，
+# 导致注册的账号与历史记录全部丢失。配置了 SQLITECLOUD_URL 时改用托管 SQLite，
+# 未配置时行为与以前完全一致（本地文件），因此不会影响本地开发。
+# 连接串形如：sqlitecloud://<host>:8860/<db>.sqlite?apikey=<apikey>
+SQLITECLOUD_URL = os.environ.get("SQLITECLOUD_URL", "").strip()
+
 _local = threading.local()
 _lock = threading.RLock()
 
@@ -59,19 +66,34 @@ def _run_schema(conn: sqlite3.Connection) -> None:
 def get_connection() -> sqlite3.Connection:
     """返回当前线程的 SQLite 连接（懒初始化 + 自动建表）。
 
-    使用线程局部存储，避免多线程共享同一连接导致的 sqlite 线程错误；
+    使用线程局部存储，避免多线程共享同一连接导致的 sqlite 线程错误
+    （sqlitecloud 驱动的 threadsafety 同样为 1，因此这里保持不变）；
     写操作由 SessionManager 的 RLock 串行化，连接层本身不引入额外并发模型。
+
+    数据源按环境二选一：
+      - 配了 SQLITECLOUD_URL → 连接 SQLite Cloud（Render 等无持久磁盘环境使用）
+      - 未配置              → 本地 SQLite 文件（默认，本地开发）
     """
     conn = getattr(_local, "conn", None)
-    if conn is None:
+    if conn is not None:
+        return conn
+    if SQLITECLOUD_URL:
+        # 延后导入：未使用云端时不强制安装该依赖
+        import sqlitecloud
+
+        # 返回的行必须支持按列名取值，对应 crud.py 中的 row["xxx"] 写法；
+        # 注意要用 sqlitecloud.Row 而非 sqlite3.Row（后者无法跨驱动实例化）。
+        conn = sqlitecloud.connect(SQLITECLOUD_URL)
+        conn.row_factory = sqlitecloud.Row
+    else:
         _ensure_dir()
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        # 外键约束开启（schema 中使用了 FK 语义，便于分发后别人理解关系）
-        conn.execute("PRAGMA foreign_keys = ON")
-        with _lock:
-            _run_schema(conn)
-        _local.conn = conn
+    # 外键约束开启（schema 中使用了 FK 语义，便于分发后别人理解关系）
+    conn.execute("PRAGMA foreign_keys = ON")
+    with _lock:
+        _run_schema(conn)
+    _local.conn = conn
     return conn
 
 
