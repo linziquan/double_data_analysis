@@ -91,17 +91,31 @@ def save_session_state(session_id: str, state: Dict[str, Any], created_at: float
     conn = get_connection()
     _ensure_sessions_user_column(conn)
     uid = to_user_id_str(user_id)
-    conn.execute(
-        """
-        INSERT INTO sessions (session_id, state_json, created_at, last_access, user_id)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
-            state_json = excluded.state_json,
-            last_access = excluded.last_access,
-            user_id = COALESCE(excluded.user_id, sessions.user_id)
-        """,
-        (session_id, _to_json(state), created_at, last_access, uid),
-    )
+    # 两段式 UPSERT：sqlitecloud 驱动执行 INSERT ... ON CONFLICT 会报
+    # "An error occurred while writing data"（本地 sqlite3 正常），故拆为
+    # SELECT 判存 + INSERT/UPDATE，两种驱动均兼容，语义与原 upsert 一致。
+    exists = conn.execute(
+        "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            """
+            INSERT INTO sessions (session_id, state_json, created_at, last_access, user_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, _to_json(state), created_at, last_access, uid),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET state_json = ?,
+                last_access = ?,
+                user_id = COALESCE(?, user_id)
+            WHERE session_id = ?
+            """,
+            (_to_json(state), last_access, uid, session_id),
+        )
     conn.commit()
 
 
@@ -378,19 +392,32 @@ def save_dataset(session_id: str, dataset_id: str, meta: Dict[str, Any],
                 f"数据集数量已达上限（{count}/{limit}），请删除部分历史数据集后再上传"
             )
     conn = get_connection()
-    conn.execute(
-        """
-        INSERT INTO datasets (dataset_id, session_id, meta_json, original_path, is_active, created_at, user_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(dataset_id) DO UPDATE SET
-            meta_json = excluded.meta_json,
-            original_path = excluded.original_path,
-            is_active = excluded.is_active,
-            user_id = excluded.user_id
-        """,
-        (dataset_id, session_id, _to_json(meta), original_path,
-         1 if is_active else 0, created_at, uid),
-    )
+    # 两段式 UPSERT：sqlitecloud 驱动不支持 INSERT ... ON CONFLICT（本地 sqlite3 正常），
+    # 拆为 SELECT 判存 + INSERT/UPDATE，两种驱动均兼容，语义与原 upsert 一致。
+    exists = conn.execute(
+        "SELECT 1 FROM datasets WHERE dataset_id = ?", (dataset_id,)
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            """
+            INSERT INTO datasets (dataset_id, session_id, meta_json, original_path, is_active, created_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (dataset_id, session_id, _to_json(meta), original_path,
+             1 if is_active else 0, created_at, uid),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE datasets
+            SET meta_json = ?,
+                original_path = ?,
+                is_active = ?,
+                user_id = ?
+            WHERE dataset_id = ?
+            """,
+            (_to_json(meta), original_path, 1 if is_active else 0, uid, dataset_id),
+        )
     conn.commit()
 
 
@@ -458,19 +485,32 @@ def save_package(package_id: str, session_id: str, dataset_id: str,
     """写入/更新分析包。user_id 透传，便于按用户归集/隔离。"""
     uid = to_user_id_str(user_id)
     conn = get_connection()
-    conn.execute(
-        """
-        INSERT INTO analysis_packages (package_id, session_id, dataset_id, payload_json, saved_at, created_at, user_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(package_id) DO UPDATE SET
-            payload_json = excluded.payload_json,
-            saved_at = excluded.saved_at,
-            dataset_id = excluded.dataset_id,
-            user_id = excluded.user_id
-        """,
-        (package_id, session_id, dataset_id, _to_json(payload),
-         saved_at, created_at, uid),
-    )
+    # 两段式 UPSERT：sqlitecloud 驱动不支持 INSERT ... ON CONFLICT（本地 sqlite3 正常），
+    # 拆为 SELECT 判存 + INSERT/UPDATE，两种驱动均兼容，语义与原 upsert 一致。
+    exists = conn.execute(
+        "SELECT 1 FROM analysis_packages WHERE package_id = ?", (package_id,)
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            """
+            INSERT INTO analysis_packages (package_id, session_id, dataset_id, payload_json, saved_at, created_at, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (package_id, session_id, dataset_id, _to_json(payload),
+             saved_at, created_at, uid),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE analysis_packages
+            SET payload_json = ?,
+                saved_at = ?,
+                dataset_id = ?,
+                user_id = ?
+            WHERE package_id = ?
+            """,
+            (_to_json(payload), saved_at, dataset_id, uid, package_id),
+        )
     conn.commit()
 
 
