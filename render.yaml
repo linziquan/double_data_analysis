@@ -17,6 +17,9 @@ services:
     name: data-analysis
     runtime: python
     plan: free
+    # 区域：新加坡（离国内最近，RTT ~50-70ms；美国 Oregon ~200ms）
+    # 注意：region 只在「通过 Blueprint 新建服务」时生效，已有服务不可改区域
+    region: singapore
     # 后端依赖清单
     buildCommand: pip install -r backend/requirements.txt
     # 进入 backend 后启动（main.py 已把项目根加入 sys.path，backend 相对导入可正常工作）
