@@ -7,6 +7,7 @@ function calling 循环，支持多轮 choice 选择、工具执行、清洗后�
 → 结构化响应 {kind, content, choices, tool_results, data_preview}
 → 前端渲染（text / choice 按钮 / 工具执行状态 / 数据预览）
 """
+import asyncio
 import traceback
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -163,7 +164,12 @@ async def api_chat_send(req: ChatRequest):
     history = session.messages if session.messages else None
 
     try:
-        result = agent.agentic_chat(message, req.session_id, history=history)
+        # agentic_chat 是同步的多轮 LLM 循环（可达数十秒），必须放入线程池执行；
+        # 直接在 async def 里调用会阻塞事件循环，导致健康检查超时（Render 报警）
+        # 与所有并发请求无响应（前端 Network Error）。与 upload 路由的 to_thread 策略一致。
+        result = await asyncio.to_thread(
+            agent.agentic_chat, message, req.session_id, history=history
+        )
     except Exception as e:
         print("[chat/send] EXCEPTION traceback:")
         traceback.print_exc()
