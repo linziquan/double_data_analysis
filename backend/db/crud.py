@@ -16,9 +16,36 @@ import sqlite3
 import time
 from typing import Optional, Dict, Any, List
 
-from .connection import get_connection
+from .connection import get_connection, close_connection
 
 logger = logging.getLogger(__name__)
+
+
+def _run_with_cloud_retry(op, attempts: int = 3):
+    """执行写操作闭包；失败时丢弃当前线程连接并重建后重试。
+
+    背景：SQLite Cloud（免费层）与 Render 实例之间的长链路存在间歇性故障——
+    同一条 SQL 时通时断，报 SQLiteCloudException（writing data /
+    reading command length from socket），而库本身经 Studio 手写验证可正常读写。
+    单次失败大概率是坏连接/坏窗口：丢弃连接重建后重试即可恢复；attempts 次
+    仍失败才向上抛出。两驱动的异常类不共享（见 connection.py 注释），故宽泛捕获。
+    """
+    last_exc: Optional[BaseException] = None
+    for i in range(attempts):
+        try:
+            return op()
+        except Exception as e:  # noqa: BLE001 —— 云端驱动异常类与 sqlite3 不共享，只能宽捕
+            last_exc = e
+            logger.warning(
+                "[cloud-retry] 写操作失败(%d/%d)：%s: %s",
+                i + 1, attempts, type(e).__name__, e,
+            )
+            try:
+                close_connection()
+            except Exception:
+                pass
+    assert last_exc is not None
+    raise last_exc
 
 
 class QuotaExceededError(Exception):
@@ -88,35 +115,37 @@ def _ensure_sessions_user_column(conn) -> None:
 def save_session_state(session_id: str, state: Dict[str, Any], created_at: float,
                        last_access: float, user_id: Optional[str] = None) -> None:
     """写入/更新会话状态（UPSERT）。user_id 透传，便于按用户归集历史会话。"""
-    conn = get_connection()
-    _ensure_sessions_user_column(conn)
     uid = to_user_id_str(user_id)
-    # 两段式 UPSERT：sqlitecloud 驱动执行 INSERT ... ON CONFLICT 会报
-    # "An error occurred while writing data"（本地 sqlite3 正常），故拆为
-    # SELECT 判存 + INSERT/UPDATE，两种驱动均兼容，语义与原 upsert 一致。
-    exists = conn.execute(
-        "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-    ).fetchone()
-    if exists is None:
-        conn.execute(
-            """
-            INSERT INTO sessions (session_id, state_json, created_at, last_access, user_id)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (session_id, _to_json(state), created_at, last_access, uid),
-        )
-    else:
-        conn.execute(
-            """
-            UPDATE sessions
-            SET state_json = ?,
-                last_access = ?,
-                user_id = COALESCE(?, user_id)
-            WHERE session_id = ?
-            """,
-            (_to_json(state), last_access, uid, session_id),
-        )
-    conn.commit()
+
+    def _write() -> None:
+        conn = get_connection()
+        _ensure_sessions_user_column(conn)
+        # 两段式 UPSERT：绕开云端驱动的兼容性问题，语义与原 upsert 一致。
+        exists = conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if exists is None:
+            conn.execute(
+                """
+                INSERT INTO sessions (session_id, state_json, created_at, last_access, user_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, _to_json(state), created_at, last_access, uid),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET state_json = ?,
+                    last_access = ?,
+                    user_id = COALESCE(?, user_id)
+                WHERE session_id = ?
+                """,
+                (_to_json(state), last_access, uid, session_id),
+            )
+        conn.commit()
+
+    _run_with_cloud_retry(_write)
 
 
 def list_sessions_by_user(user_id: Any) -> List[Dict[str, Any]]:
@@ -391,34 +420,35 @@ def save_dataset(session_id: str, dataset_id: str, meta: Dict[str, Any],
             raise QuotaExceededError(
                 f"数据集数量已达上限（{count}/{limit}），请删除部分历史数据集后再上传"
             )
-    conn = get_connection()
-    # 两段式 UPSERT：sqlitecloud 驱动不支持 INSERT ... ON CONFLICT（本地 sqlite3 正常），
-    # 拆为 SELECT 判存 + INSERT/UPDATE，两种驱动均兼容，语义与原 upsert 一致。
-    exists = conn.execute(
-        "SELECT 1 FROM datasets WHERE dataset_id = ?", (dataset_id,)
-    ).fetchone()
-    if exists is None:
-        conn.execute(
-            """
-            INSERT INTO datasets (dataset_id, session_id, meta_json, original_path, is_active, created_at, user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (dataset_id, session_id, _to_json(meta), original_path,
-             1 if is_active else 0, created_at, uid),
-        )
-    else:
-        conn.execute(
-            """
-            UPDATE datasets
-            SET meta_json = ?,
-                original_path = ?,
-                is_active = ?,
-                user_id = ?
-            WHERE dataset_id = ?
-            """,
-            (_to_json(meta), original_path, 1 if is_active else 0, uid, dataset_id),
-        )
-    conn.commit()
+    def _write() -> None:
+        conn = get_connection()
+        exists = conn.execute(
+            "SELECT 1 FROM datasets WHERE dataset_id = ?", (dataset_id,)
+        ).fetchone()
+        if exists is None:
+            conn.execute(
+                """
+                INSERT INTO datasets (dataset_id, session_id, meta_json, original_path, is_active, created_at, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (dataset_id, session_id, _to_json(meta), original_path,
+                 1 if is_active else 0, created_at, uid),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE datasets
+                SET meta_json = ?,
+                    original_path = ?,
+                    is_active = ?,
+                    user_id = ?
+                WHERE dataset_id = ?
+                """,
+                (_to_json(meta), original_path, 1 if is_active else 0, uid, dataset_id),
+            )
+        conn.commit()
+
+    _run_with_cloud_retry(_write)
 
 
 def _all_dataset_metas(session_id: str) -> List[Dict[str, Any]]:
@@ -484,34 +514,36 @@ def save_package(package_id: str, session_id: str, dataset_id: str,
                  created_at: float, user_id: Optional[str] = None) -> None:
     """写入/更新分析包。user_id 透传，便于按用户归集/隔离。"""
     uid = to_user_id_str(user_id)
-    conn = get_connection()
-    # 两段式 UPSERT：sqlitecloud 驱动不支持 INSERT ... ON CONFLICT（本地 sqlite3 正常），
-    # 拆为 SELECT 判存 + INSERT/UPDATE，两种驱动均兼容，语义与原 upsert 一致。
-    exists = conn.execute(
-        "SELECT 1 FROM analysis_packages WHERE package_id = ?", (package_id,)
-    ).fetchone()
-    if exists is None:
-        conn.execute(
-            """
-            INSERT INTO analysis_packages (package_id, session_id, dataset_id, payload_json, saved_at, created_at, user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (package_id, session_id, dataset_id, _to_json(payload),
-             saved_at, created_at, uid),
-        )
-    else:
-        conn.execute(
-            """
-            UPDATE analysis_packages
-            SET payload_json = ?,
-                saved_at = ?,
-                dataset_id = ?,
-                user_id = ?
-            WHERE package_id = ?
-            """,
-            (_to_json(payload), saved_at, dataset_id, uid, package_id),
-        )
-    conn.commit()
+
+    def _write() -> None:
+        conn = get_connection()
+        exists = conn.execute(
+            "SELECT 1 FROM analysis_packages WHERE package_id = ?", (package_id,)
+        ).fetchone()
+        if exists is None:
+            conn.execute(
+                """
+                INSERT INTO analysis_packages (package_id, session_id, dataset_id, payload_json, saved_at, created_at, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (package_id, session_id, dataset_id, _to_json(payload),
+                 saved_at, created_at, uid),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE analysis_packages
+                SET payload_json = ?,
+                    saved_at = ?,
+                    dataset_id = ?,
+                    user_id = ?
+                WHERE package_id = ?
+                """,
+                (_to_json(payload), saved_at, dataset_id, uid, package_id),
+            )
+        conn.commit()
+
+    _run_with_cloud_retry(_write)
 
 
 def load_package(package_id: str) -> Optional[Dict[str, Any]]:
@@ -557,13 +589,17 @@ def delete_package(package_id: str) -> None:
 
 def create_user(username: str, password_hash: str) -> int:
     """创建用户，返回新用户 id。"""
-    conn = get_connection()
-    cur = conn.execute(
-        "INSERT INTO users (username, password_hash, token_version, created_at) VALUES (?, ?, 0, ?)",
-        (username, password_hash, time.time()),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
+
+    def _write() -> int:
+        conn = get_connection()
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, token_version, created_at) VALUES (?, ?, 0, ?)",
+            (username, password_hash, time.time()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+    return _run_with_cloud_retry(_write)
 
 
 def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
