@@ -21,7 +21,7 @@ from .connection import get_connection, close_connection
 logger = logging.getLogger(__name__)
 
 
-def _run_with_cloud_retry(op, attempts: int = 3):
+def _run_with_cloud_retry(op, attempts: int = 2):
     """执行写操作闭包；失败时丢弃当前线程连接并重建后重试。
 
     背景：SQLite Cloud（免费层）与 Render 实例之间的长链路存在间歇性故障——
@@ -29,6 +29,10 @@ def _run_with_cloud_retry(op, attempts: int = 3):
     reading command length from socket），而库本身经 Studio 手写验证可正常读写。
     单次失败大概率是坏连接/坏窗口：丢弃连接重建后重试即可恢复；attempts 次
     仍失败才向上抛出。两驱动的异常类不共享（见 connection.py 注释），故宽泛捕获。
+
+    配合 connection.py 的 DSN 超时（connect_timeout=30 / timeout=15），单次失败
+    会在上限内快速抛出并触发重建；attempts 降到 2 并加 0.3s 退避，避免叠加挂起
+    冲过 Render(~50s) 代理掐断阈值导致前端 Network Error。
     """
     last_exc: Optional[BaseException] = None
     for i in range(attempts):
@@ -44,6 +48,9 @@ def _run_with_cloud_retry(op, attempts: int = 3):
                 close_connection()
             except Exception:
                 pass
+            # 非最后一次才退避，避免无谓等待
+            if i < attempts - 1:
+                time.sleep(0.3)
     assert last_exc is not None
     raise last_exc
 
@@ -331,21 +338,25 @@ def load_session_state(session_id: str) -> Optional[Dict[str, Any]]:
 
 def touch_session(session_id: str, last_access: float) -> None:
     """仅更新会话最后访问时间。"""
-    conn = get_connection()
-    conn.execute(
-        "UPDATE sessions SET last_access = ? WHERE session_id = ?",
-        (last_access, session_id),
-    )
-    conn.commit()
+    def _write() -> None:
+        conn = get_connection()
+        conn.execute(
+            "UPDATE sessions SET last_access = ? WHERE session_id = ?",
+            (last_access, session_id),
+        )
+        conn.commit()
+    _run_with_cloud_retry(_write)
 
 
 def delete_session(session_id: str) -> None:
     """删除会话及其全部数据集、分析包（级联清理）。"""
-    conn = get_connection()
-    conn.execute("DELETE FROM analysis_packages WHERE session_id = ?", (session_id,))
-    conn.execute("DELETE FROM datasets WHERE session_id = ?", (session_id,))
-    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-    conn.commit()
+    def _write() -> None:
+        conn = get_connection()
+        conn.execute("DELETE FROM analysis_packages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM datasets WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+    _run_with_cloud_retry(_write)
 
 
 def delete_session_by_user(user_id: Any, session_id: str) -> tuple[bool, list[str]]:
@@ -690,47 +701,52 @@ def reassign_session_to_user(session_id: str, user_id: str, window_seconds: int 
     uid = to_user_id_str(user_id)
     if uid is None:
         return False
-    conn = get_connection()
-    cutoff = time.time() - window_seconds
-    # 先单独判「非空」：至少 1 个 dataset 或 1 个 analysis_package
-    nonempty_check = conn.execute(
-        """
-        SELECT
-          (SELECT COUNT(*) FROM datasets        WHERE session_id = ? AND user_id IS NULL) AS d_count,
-          (SELECT COUNT(*) FROM analysis_packages WHERE session_id = ? AND user_id IS NULL) AS p_count
-        """,
-        (session_id, session_id),
-    ).fetchone()
-    if not nonempty_check or (nonempty_check["d_count"] == 0 and nonempty_check["p_count"] == 0):
-        # 空 session 不绑定：直接返回 False；该 session 在游客端继续存在（user_id 仍为 NULL），
-        # 不会被 list_sessions_by_user 列出，不污染历史。游客后续如要继续工作，可重新登录后
-        # 调 /api/session/new 拿新 sessionId 替换。
+
+    def _write() -> bool:
+        conn = get_connection()
+        cutoff = time.time() - window_seconds
+        # 先单独判「非空」：至少 1 个 dataset 或 1 个 analysis_package
+        nonempty_check = conn.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM datasets        WHERE session_id = ? AND user_id IS NULL) AS d_count,
+              (SELECT COUNT(*) FROM analysis_packages WHERE session_id = ? AND user_id IS NULL) AS p_count
+            """,
+            (session_id, session_id),
+        ).fetchone()
+        if not nonempty_check or (nonempty_check["d_count"] == 0 and nonempty_check["p_count"] == 0):
+            # 空 session 不绑定：直接返回 False；该 session 在游客端继续存在（user_id 仍为 NULL），
+            # 不会被 list_sessions_by_user 列出，不污染历史。游客后续如要继续工作，可重新登录后
+            # 调 /api/session/new 拿新 sessionId 替换。
+            conn.commit()
+            return False
+        cur = conn.execute(
+            """
+            UPDATE sessions
+            SET user_id = ?
+            WHERE session_id = ? AND user_id IS NULL AND last_access > ?
+            """,
+            (uid, session_id, cutoff),
+        )
+        affected = cur.rowcount
+        if affected > 0:
+            # 同步回填该 session 下的数据集与分析包（事务）
+            conn.execute(
+                "UPDATE datasets SET user_id = ? WHERE session_id = ? AND user_id IS NULL",
+                (uid, session_id),
+            )
+            conn.execute(
+                "UPDATE analysis_packages SET user_id = ? WHERE session_id = ? AND user_id IS NULL",
+                (uid, session_id),
+            )
         conn.commit()
-        return False
-    cur = conn.execute(
-        """
-        UPDATE sessions
-        SET user_id = ?
-        WHERE session_id = ? AND user_id IS NULL AND last_access > ?
-        """,
-        (uid, session_id, cutoff),
-    )
-    affected = cur.rowcount
-    if affected > 0:
-        # 同步回填该 session 下的数据集与分析包（事务）
-        conn.execute(
-            "UPDATE datasets SET user_id = ? WHERE session_id = ? AND user_id IS NULL",
-            (uid, session_id),
-        )
-        conn.execute(
-            "UPDATE analysis_packages SET user_id = ? WHERE session_id = ? AND user_id IS NULL",
-            (uid, session_id),
-        )
-    conn.commit()
+        return affected > 0
+
+    ok = _run_with_cloud_retry(_write)
     # 会话数量上限：每个用户最多保留 MAX_SESSIONS_PER_USER 条，超出则删除最旧的
-    if affected > 0:
+    if ok:
         prune_user_sessions(uid)
-    return affected > 0
+    return ok
 
 
 # 每个用户保留的历史会话上限（超出删除最旧）

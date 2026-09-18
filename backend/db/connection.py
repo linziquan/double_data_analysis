@@ -15,6 +15,7 @@ import os
 import sqlite3
 import threading
 import logging
+import time
 from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -127,8 +128,47 @@ def _run_schema(conn: sqlite3.Connection) -> None:
     _SCHEMA_READY = True
 
 
+# ===== 云端连接超时与存活管理 =====
+# 关键背景：sqlitecloud 0.0.84 的原生 SQLiteCloudConfig 自带 connect_timeout
+# （默认 30s）与 timeout（默认 0，即操作无超时）。当前代码 connect(SQLITECLOUD_URL)
+# 传的是字符串 DSN，SDK 会用 SQLiteCloudConfig(dsn) 重新解析并忽略外部 config 参数，
+# 因此超时参数必须写进 DSN 查询串才生效。timeout=0 会让写操作在抖动链路上无限挂起，
+# 超过 Render 代理(~50s)后被掐断成前端 Network Error；这里显式给一个上限。
+_CLOUD_CONNECT_TIMEOUT = 30   # 建连上限（秒），贴近但不超 50s 代理掐断阈值
+_CLOUD_SOCKET_TIMEOUT = 15    # 单次操作（含探活 SELECT 1）上限（秒）
+_CLOUD_IDLE_MAX = 30          # 连接最大空闲秒数，超过则复用时先探活
+
+
+def _inject_cloud_timeouts(dsn: str) -> str:
+    """向 SQLite Cloud DSN 查询串注入 connect_timeout/timeout（已设置则保留原值）。
+
+    仅在 DSN 未显式包含这两个 key 时追加，便于在 Render 环境变量里手动覆盖。
+    """
+    has_connect = "connect_timeout" in dsn
+    has_timeout = "timeout" in dsn
+    if has_connect and has_timeout:
+        return dsn
+    sep = "&" if "?" in dsn else "?"
+    added = []
+    if not has_connect:
+        added.append(f"connect_timeout={_CLOUD_CONNECT_TIMEOUT}")
+    if not has_timeout:
+        added.append(f"timeout={_CLOUD_SOCKET_TIMEOUT}")
+    return dsn + sep + "&".join(added)
+
+
+def _probe_alive(conn) -> bool:
+    """轻量存活探针：受 DSN 的 timeout 约束，死连接会快速抛错而非挂起。"""
+    try:
+        conn.execute("SELECT 1").fetchone()
+        return True
+    except Exception as e:
+        logger.debug("云端连接探活失败: %s", e)
+        return False
+
+
 def get_connection() -> sqlite3.Connection:
-    """返回当前线程的 SQLite 连接（懒初始化 + 自动建表）。
+    """返回当前线程的 SQLite 连接（懒初始化 + 自动建表 + 空闲探活自愈）。
 
     使用线程局部存储，避免多线程共享同一连接导致的 sqlite 线程错误
     （sqlitecloud 驱动的 threadsafety 同样为 1，因此这里保持不变）；
@@ -137,17 +177,36 @@ def get_connection() -> sqlite3.Connection:
     数据源按环境二选一：
       - 配了 SQLITECLOUD_URL → 连接 SQLite Cloud（Render 等无持久磁盘环境使用）
       - 未配置              → 本地 SQLite 文件（默认，本地开发）
+
+    云端连接自愈：空闲超过 _CLOUD_IDLE_MAX 秒的缓存连接可能已死
+    （SQLite Cloud 免费层长链路间歇断连），复用时先发 SELECT 1 探活，
+    失败则关闭重建，避免写操作时才暴露 "writing data"。
     """
     conn = getattr(_local, "conn", None)
+    last_used = getattr(_local, "last_used", 0.0)
+    now = time.time()
     if conn is not None:
-        return conn
+        # 仅云端连接需要探活；本地文件连接不会"死"。
+        if SQLITECLOUD_URL and (now - last_used) > _CLOUD_IDLE_MAX:
+            if not _probe_alive(conn):
+                logger.info("云端连接空闲过久且探活失败，关闭并重建")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+        if conn is not None:
+            _local.last_used = now
+            return conn
     if SQLITECLOUD_URL:
         # 延后导入：未使用云端时不强制安装该依赖
         import sqlitecloud
 
         # 返回的行必须支持按列名取值，对应 crud.py 中的 row["xxx"] 写法；
         # 注意要用 sqlitecloud.Row 而非 sqlite3.Row（后者无法跨驱动实例化）。
-        conn = sqlitecloud.connect(SQLITECLOUD_URL)
+        # 超时参数写进 DSN 查询串（见 _inject_cloud_timeouts 说明）。
+        dsn = _inject_cloud_timeouts(SQLITECLOUD_URL)
+        conn = sqlitecloud.connect(dsn)
         conn.row_factory = sqlitecloud.Row
         # 只打印主机/库名，绝不打 apikey
         logger.info("已连接 SQLite Cloud 托管库: %s", SQLITECLOUD_URL.split("?")[0])
@@ -164,6 +223,7 @@ def get_connection() -> sqlite3.Connection:
     with _lock:
         _run_schema(conn)
     _local.conn = conn
+    _local.last_used = time.time()
     return conn
 
 
@@ -176,6 +236,7 @@ def close_connection() -> None:
         except Exception:
             pass
         _local.conn = None
+        _local.last_used = 0.0
 
 
 def init_db() -> None:
