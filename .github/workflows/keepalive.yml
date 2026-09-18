@@ -1,0 +1,27 @@
+name: Keep Render Awake
+
+on:
+  # 每 5 分钟 ping 一次，避免 Render 免费实例休眠导致登录冷启动慢/超时。
+  # GitHub Actions 定时任务最小粒度为 5 分钟，已足够覆盖 Render 约 15 分钟的休眠窗口。
+  schedule:
+    - cron: "*/5 * * * *"
+  # 允许在 Actions 页面手动触发，便于首次部署后立即验证
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping backend db-ping (keeps SQLite Cloud connection warm)
+        run: |
+          curl -fsS -m 30 "https://double-data-analysis-1111.onrender.com/api/db-ping" \
+            || echo "WARN: backend db-ping failed"
+      - name: Ping backend health
+        run: |
+          curl -fsS -m 30 "https://double-data-analysis-1111.onrender.com/api/health" \
+            || echo "WARN: backend health failed"
+      - name: Ping frontend
+        run: |
+          curl -fsS -m 30 "https://double-data-analysis-1.onrender.com/" \
+            || echo "WARN: frontend ping failed"

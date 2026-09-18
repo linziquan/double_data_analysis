@@ -4,6 +4,7 @@ DataMind AI - FastAPI 后端入口
 """
 import os
 import sys
+import time
 import traceback
 
 # 添加项目根目录到 sys.path，以便导入现有模块
@@ -24,7 +25,7 @@ from fastapi.responses import JSONResponse, FileResponse, Response
 # 导入路由
 from backend.routers import upload, data, clean, chart, dashboard, insights, report, analysis, chat, auth, history
 from backend.services.session_manager import manager
-from backend.db.connection import init_db
+from backend.db.connection import init_db, get_connection, SQLITECLOUD_URL
 
 # ===== 强制 UTF-8 编码，避免 Windows 环境下 print() 中文报错 =====
 import sys as _sys
@@ -120,6 +121,31 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def health_check():
     """健康检查接口"""
     return {"status": "ok", "version": "1.0.0"}
+
+
+@app.get("/api/db-ping")
+async def db_ping():
+    """轻量数据库探活：供外部保活定时任务（如 GitHub Actions 每 5 分钟 ping 一次）调用。
+
+    作用：让 Render 免费实例保持唤醒，并周期性复用 SQLite Cloud 连接，
+    使真实登录时基本不触发冷连接重建，登录更快更稳。
+    返回 ok / 数据库类型 / 本次探活耗时（毫秒）。"""
+    t0 = time.time()
+    try:
+        conn = get_connection()
+        conn.execute("SELECT 1").fetchone()
+        return {
+            "ok": True,
+            "db": "cloud" if SQLITECLOUD_URL else "local",
+            "latency_ms": round((time.time() - t0) * 1000, 1),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "db": "cloud" if SQLITECLOUD_URL else "local",
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "latency_ms": round((time.time() - t0) * 1000, 1),
+        }
 
 
 
