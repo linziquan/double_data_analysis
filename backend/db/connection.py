@@ -293,6 +293,7 @@ def get_connection() -> sqlite3.Connection:
     失败则关闭重建，避免写操作时才暴露 "writing data"。建连开销因此只在
     进程启动/重建时发生一次，日常请求直接复用温连接。
     """
+    global _shared_last_used
     with _db_lock:
         conn = _shared_conn
         if conn is not None and SQLITECLOUD_URL and (time.time() - _shared_last_used) > _CLOUD_IDLE_MAX:
