@@ -77,6 +77,26 @@ def _startup_init_db():
     except Exception as exc:
         _logger.warning(f"冷启动清空游客数据失败(可忽略): {exc}")
 
+    # 进程内心跳：每 60s 探活一次共享连接，确保 SQLite Cloud 连接保持温热，
+    # 避免免费层空闲断开导致下次请求重建（约 20s）。与 GitHub Actions 保活互补
+    # （后者负责让 Render 实例不休眠，前者负责让数据库连接不冷）。
+    try:
+        import threading as _threading
+
+        def _db_heartbeat():
+            while True:
+                _threading.Event().wait(60)
+                try:
+                    c = get_connection()
+                    c.execute("SELECT 1").fetchone()
+                except Exception as _he:
+                    _logger.warning(f"DB 心跳失败(将在下次请求重建连接): {_he}")
+
+        _hb = _threading.Thread(target=_db_heartbeat, name="db-heartbeat", daemon=True)
+        _hb.start()
+    except Exception as exc:
+        _logger.warning(f"启动 DB 心跳线程失败(可忽略): {exc}")
+
 
 # CORS 配置 - 演示阶段允许所有来源（生产环境应限制）
 app.add_middleware(

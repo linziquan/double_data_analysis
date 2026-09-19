@@ -33,8 +33,17 @@ DB_PATH = os.environ.get("DB_PATH", _default_db_path)
 # 连接串形如：sqlitecloud://<host>:8860/<db>.sqlite?apikey=<apikey>
 SQLITECLOUD_URL = os.environ.get("SQLITECLOUD_URL", "").strip()
 
-_local = threading.local()
-_lock = threading.RLock()
+# ===== 单例共享连接（替代线程局部）=====
+# 原先每个线程各自维护一条到 SQLite Cloud 的连接，问题是：外部保活定时任务
+# （GitHub Actions / 进程内心跳）只捂热了「一个线程」的连接，而登录等请求跑在
+# 另一个线程池线程，每次都新建连接（SQLite Cloud 免费层建连约 20s）→ 登录慢。
+# 改成「全进程唯一一条共享连接」，所有线程复用同一条温连接，建连开销只在
+# 进程启动/重建时发生一次；并用全局锁串行化所有数据库操作（sqlitecloud
+# threadsafety=1，连接本身不可跨线程并发使用）。
+_shared_conn = None            # 共享连接（_LockedConn 包装）
+_shared_last_used = 0.0       # 上次使用时间（用于空闲探活）
+_db_lock = threading.RLock()  # 串行化所有数据库操作
+_lock = threading.RLock()     # 建表 schema 专用（与 _db_lock 配合，顺序固定避免死锁）
 
 # 进程级标记：schema 建表只需成功执行一次。
 # 不设该死标记的话，每个线程新建连接都会重复跑一遍 schema.sql + 列检查，
@@ -157,6 +166,75 @@ def _inject_cloud_timeouts(dsn: str) -> str:
     return dsn + sep + "&".join(added)
 
 
+class _LockedCursor:
+    """游标代理：fetch 类方法在全局锁内执行，兼容 sqlitecloud / sqlite3 游标。"""
+
+    def __init__(self, cursor, lock):
+        object.__setattr__(self, "_cursor", cursor)
+        object.__setattr__(self, "_lock", lock)
+
+    def fetchone(self):
+        with self._lock:
+            return self._cursor.fetchone()
+
+    def fetchall(self):
+        with self._lock:
+            return self._cursor.fetchall()
+
+    def fetchmany(self, *args, **kwargs):
+        with self._lock:
+            return self._cursor.fetchmany(*args, **kwargs)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(self._cursor)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _LockedConn:
+    """连接代理：所有数据库操作在全局锁内串行执行，使单条共享连接可安全跨线程复用。"""
+
+    def __init__(self, conn, lock):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_lock", lock)
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return _LockedCursor(self._conn.execute(*args, **kwargs), self._lock)
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return _LockedCursor(self._conn.executemany(*args, **kwargs), self._lock)
+
+    def commit(self):
+        with self._lock:
+            return self._conn.commit()
+
+    def rollback(self):
+        with self._lock:
+            return self._conn.rollback()
+
+    def close(self):
+        with self._lock:
+            return self._conn.close()
+
+    @property
+    def row_factory(self):
+        with self._lock:
+            return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        with self._lock:
+            self._conn.row_factory = value
+
+    def __getattr__(self, name):
+        with self._lock:
+            return getattr(self._conn, name)
+
+
 def _probe_alive(conn) -> bool:
     """轻量存活探针：受 DSN 的 timeout 约束，死连接会快速抛错而非挂起。"""
     try:
@@ -167,37 +245,9 @@ def _probe_alive(conn) -> bool:
         return False
 
 
-def get_connection() -> sqlite3.Connection:
-    """返回当前线程的 SQLite 连接（懒初始化 + 自动建表 + 空闲探活自愈）。
-
-    使用线程局部存储，避免多线程共享同一连接导致的 sqlite 线程错误
-    （sqlitecloud 驱动的 threadsafety 同样为 1，因此这里保持不变）；
-    写操作由 SessionManager 的 RLock 串行化，连接层本身不引入额外并发模型。
-
-    数据源按环境二选一：
-      - 配了 SQLITECLOUD_URL → 连接 SQLite Cloud（Render 等无持久磁盘环境使用）
-      - 未配置              → 本地 SQLite 文件（默认，本地开发）
-
-    云端连接自愈：空闲超过 _CLOUD_IDLE_MAX 秒的缓存连接可能已死
-    （SQLite Cloud 免费层长链路间歇断连），复用时先发 SELECT 1 探活，
-    失败则关闭重建，避免写操作时才暴露 "writing data"。
-    """
-    conn = getattr(_local, "conn", None)
-    last_used = getattr(_local, "last_used", 0.0)
-    now = time.time()
-    if conn is not None:
-        # 仅云端连接需要探活；本地文件连接不会"死"。
-        if SQLITECLOUD_URL and (now - last_used) > _CLOUD_IDLE_MAX:
-            if not _probe_alive(conn):
-                logger.info("云端连接空闲过久且探活失败，关闭并重建")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = None
-        if conn is not None:
-            _local.last_used = now
-            return conn
+def _create_connection():
+    """新建并初始化一条共享连接（含建表）。调用方需已持有 _db_lock。"""
+    global _shared_conn
     if SQLITECLOUD_URL:
         # 延后导入：未使用云端时不强制安装该依赖
         import sqlitecloud
@@ -222,21 +272,55 @@ def get_connection() -> sqlite3.Connection:
         logger.debug("PRAGMA foreign_keys 不受支持（已忽略）: %s", e)
     with _lock:
         _run_schema(conn)
-    _local.conn = conn
-    _local.last_used = time.time()
-    return conn
+    _shared_conn = _LockedConn(conn, _db_lock)
+    return _shared_conn
+
+
+def get_connection() -> sqlite3.Connection:
+    """返回全进程共享的唯一 SQLite 连接（懒初始化 + 空闲探活自愈 + 全局串行化）。
+
+    单例共享：所有线程（保活定时任务、登录请求、后台心跳）复用同一条连接，
+    避免「每个线程各自建连」导致的登录冷连接慢（SQLite Cloud 免费层建连约 20s）。
+    全局锁 _db_lock 串行化所有 execute/commit，兼容 sqlitecloud threadsafety=1
+    （连接本身不可跨线程并发使用）。
+
+    数据源按环境二选一：
+      - 配了 SQLITECLOUD_URL → 连接 SQLite Cloud（Render 等无持久磁盘环境使用）
+      - 未配置              → 本地 SQLite 文件（默认，本地开发）
+
+    云端连接自愈：空闲超过 _CLOUD_IDLE_MAX 秒的共享连接可能已死
+    （SQLite Cloud 免费层长链路间歇断连），复用时先发 SELECT 1 探活，
+    失败则关闭重建，避免写操作时才暴露 "writing data"。建连开销因此只在
+    进程启动/重建时发生一次，日常请求直接复用温连接。
+    """
+    with _db_lock:
+        conn = _shared_conn
+        if conn is not None and SQLITECLOUD_URL and (time.time() - _shared_last_used) > _CLOUD_IDLE_MAX:
+            if not _probe_alive(conn):
+                logger.info("云端连接空闲过久且探活失败，关闭并重建")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+        if conn is None:
+            conn = _create_connection()
+        _shared_last_used = time.time()
+        return conn
 
 
 def close_connection() -> None:
-    """关闭当前线程连接（进程退出或测试清理时调用）。"""
-    conn = getattr(_local, "conn", None)
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        _local.conn = None
-        _local.last_used = 0.0
+    """关闭共享连接（进程退出或测试清理时调用）。"""
+    global _shared_conn, _shared_last_used
+    with _db_lock:
+        conn = _shared_conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _shared_conn = None
+        _shared_last_used = 0.0
 
 
 def init_db() -> None:
